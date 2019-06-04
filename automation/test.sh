@@ -31,6 +31,7 @@ set -ex
 export WORKSPACE="${WORKSPACE:-$PWD}"
 readonly ARTIFACTS_PATH="${ARTIFACTS-$WORKSPACE/exported-artifacts}"
 readonly TEMPLATES_SERVER="https://templates.ovirt.org/kubevirt/"
+readonly BAZEL_CACHE="${BAZEL_CACHE:-http://bazel-cache.kubevirt-prow.svc.cluster.local:8080/kubevirt.io/kubevirt}"
 
 if [[ $TARGET =~ windows.* ]]; then
   export KUBEVIRT_PROVIDER="k8s-1.11.0"
@@ -147,7 +148,7 @@ trap '{ make cluster-down; }' EXIT SIGINT SIGTERM SIGSTOP
 
 
 # Check if we are on a pull request in jenkins.
-export KUBEVIRT_CACHE_FROM=${ghprbTargetBranch}
+export KUBEVIRT_CACHE_FROM=${PULL_BASE_REF}
 if [ -n "${KUBEVIRT_CACHE_FROM}" ]; then
     make pull-cache
 fi
@@ -158,7 +159,7 @@ make cluster-down
 cat >.bazelrc <<EOF
 startup --host_jvm_args=-Dbazel.DigestFunction=sha256
 build --remote_local_fallback
-build --remote_http_cache=http://bazel-cache.kubevirt-prow.svc.cluster.local:8080/kubevirt.io/kubevirt
+build --remote_http_cache=${BAZEL_CACHE}
 EOF
 
 # build all images with the basic repeat logic

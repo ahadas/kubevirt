@@ -152,6 +152,12 @@ const (
 	// CloneInProgress represents a data volume with a current phase of CloneInProgress
 	CloneInProgress DataVolumePhase = "CloneInProgress"
 
+	// SnapshotForSmartCloneInProgress represents a data volume with a current phase of SnapshotForSmartCloneInProgress
+	SnapshotForSmartCloneInProgress DataVolumePhase = "SnapshotForSmartCloneInProgress"
+
+	// SmartClonePVCInProgress represents a data volume with a current phase of SmartClonePVCInProgress
+	SmartClonePVCInProgress DataVolumePhase = "SmartClonePVCInProgress"
+
 	// UploadScheduled represents a data volume with a current phase of UploadScheduled
 	UploadScheduled DataVolumePhase = "UploadScheduled"
 
@@ -183,6 +189,10 @@ type CDI struct {
 
 // CDISpec defines our specification for the CDI installation
 type CDISpec struct {
+	ImageRegistry string `json:"imageRegistry,omitempty"`
+
+	ImageTag string `json:"imageTag,omitempty"`
+
 	ImagePullPolicy corev1.PullPolicy `json:"imagePullPolicy,omitempty" valid:"required"`
 }
 

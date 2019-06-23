@@ -10,7 +10,7 @@ const (
 func SetDefaults_Devices(devices *Devices) {
 	// Set default memballoon, "none" means that controller disabled
 	devices.Ballooning = &Ballooning{
-		Model: "none",
+		Model: "virtio",
 	}
 
 }

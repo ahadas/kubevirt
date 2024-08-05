@@ -23,12 +23,16 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"k8s.io/api/admission/v1beta1"
+	"kubevirt.io/kubevirt/pkg/virt-config/deprecation"
+
+	admissionv1 "k8s.io/api/admission/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	k8sfield "k8s.io/apimachinery/pkg/util/validation/field"
 
-	v1 "kubevirt.io/kubevirt/pkg/api/v1"
+	v1 "kubevirt.io/api/core/v1"
+
+	webhookutils "kubevirt.io/kubevirt/pkg/util/webhooks"
 	"kubevirt.io/kubevirt/pkg/virt-api/webhooks"
 	virtconfig "kubevirt.io/kubevirt/pkg/virt-config"
 )
@@ -37,13 +41,13 @@ type VMIRSAdmitter struct {
 	ClusterConfig *virtconfig.ClusterConfig
 }
 
-func (admitter *VMIRSAdmitter) Admit(ar *v1beta1.AdmissionReview) *v1beta1.AdmissionResponse {
-	if ar.Request.Resource != webhooks.VirtualMachineInstanceReplicaSetGroupVersionResource {
+func (admitter *VMIRSAdmitter) Admit(ar *admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
+	if !webhookutils.ValidateRequestResource(ar.Request.Resource, webhooks.VirtualMachineInstanceReplicaSetGroupVersionResource.Group, webhooks.VirtualMachineInstanceReplicaSetGroupVersionResource.Resource) {
 		err := fmt.Errorf("expect resource to be '%s'", webhooks.VirtualMachineInstanceReplicaSetGroupVersionResource.Resource)
-		return webhooks.ToAdmissionResponseError(err)
+		return webhookutils.ToAdmissionResponseError(err)
 	}
 
-	if resp := webhooks.ValidateSchema(v1.VirtualMachineInstanceReplicaSetGroupVersionKind, ar.Request.Object.Raw); resp != nil {
+	if resp := webhookutils.ValidateSchema(v1.VirtualMachineInstanceReplicaSetGroupVersionKind, ar.Request.Object.Raw); resp != nil {
 		return resp
 	}
 
@@ -52,17 +56,26 @@ func (admitter *VMIRSAdmitter) Admit(ar *v1beta1.AdmissionReview) *v1beta1.Admis
 
 	err := json.Unmarshal(raw, &vmirs)
 	if err != nil {
-		return webhooks.ToAdmissionResponseError(err)
+		return webhookutils.ToAdmissionResponseError(err)
 	}
 
 	causes := ValidateVMIRSSpec(k8sfield.NewPath("spec"), &vmirs.Spec, admitter.ClusterConfig)
-	if len(causes) > 0 {
-		return webhooks.ToAdmissionResponse(causes)
+
+	if ar.Request.Operation == admissionv1.Create {
+		clusterCfg := admitter.ClusterConfig.GetConfig()
+		if devCfg := clusterCfg.DeveloperConfiguration; devCfg != nil {
+			causes = append(causes, deprecation.ValidateFeatureGates(devCfg.FeatureGates, &vmirs.Spec.Template.Spec)...)
+		}
 	}
 
-	reviewResponse := v1beta1.AdmissionResponse{}
-	reviewResponse.Allowed = true
-	return &reviewResponse
+	if len(causes) > 0 {
+		return webhookutils.ToAdmissionResponse(causes)
+	}
+
+	return &admissionv1.AdmissionResponse{
+		Allowed:  true,
+		Warnings: warnDeprecatedAPIs(&vmirs.Spec.Template.Spec, admitter.ClusterConfig),
+	}
 }
 
 func ValidateVMIRSSpec(field *k8sfield.Path, spec *v1.VirtualMachineInstanceReplicaSetSpec, config *virtconfig.ClusterConfig) []metav1.StatusCause {

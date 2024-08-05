@@ -22,7 +22,7 @@ package config
 import (
 	"path/filepath"
 
-	v1 "kubevirt.io/kubevirt/pkg/api/v1"
+	v1 "kubevirt.io/api/core/v1"
 )
 
 // GetServiceAccountDiskPath returns a path to the ServiceAccount iso image
@@ -30,21 +30,22 @@ func GetServiceAccountDiskPath() string {
 	return filepath.Join(ServiceAccountDiskDir, ServiceAccountDiskName)
 }
 
-// CreateServiceAccountDisk creates the ServiceAccount iso disk which is attached to vmis
-func CreateServiceAccountDisk(vmi *v1.VirtualMachineInstance) error {
-	for _, volume := range vmi.Spec.Volumes {
-		if volume.ServiceAccount != nil {
-			var filesPath []string
-			filesPath, err := getFilesLayout(ServiceAccountSourceDir)
-			if err != nil {
-				return err
-			}
+type serviceAccountVolumeInfo struct{}
 
-			err = createIsoConfigImage(GetServiceAccountDiskPath(), filesPath)
-			if err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+func (i serviceAccountVolumeInfo) isValidType(v *v1.Volume) bool {
+	return v.ServiceAccount != nil
+}
+func (i serviceAccountVolumeInfo) getSourcePath(v *v1.Volume) string {
+	return ServiceAccountSourceDir
+}
+func (i serviceAccountVolumeInfo) getIsoPath(v *v1.Volume) string {
+	return GetServiceAccountDiskPath()
+}
+func (i serviceAccountVolumeInfo) getLabel(v *v1.Volume) string {
+	return ""
+}
+
+// CreateServiceAccountDisk creates the ServiceAccount iso disk which is attached to vmis
+func CreateServiceAccountDisk(vmi *v1.VirtualMachineInstance, emptyIso bool) error {
+	return createIsoDisksForConfigVolumes(vmi, emptyIso, serviceAccountVolumeInfo{})
 }

@@ -23,17 +23,17 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
-	"io/ioutil"
 	"os"
-	"reflect"
+	"strings"
 
 	"github.com/golang/mock/gomock"
-	libvirt "github.com/libvirt/libvirt-go"
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"k8s.io/apimachinery/pkg/api/equality"
+	"libvirt.org/go/libvirt"
 
-	"kubevirt.io/kubevirt/pkg/log"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/stats"
+	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/statsconv/util"
 )
 
 var _ = Describe("StatsConverter", func() {
@@ -41,26 +41,26 @@ var _ = Describe("StatsConverter", func() {
 	var ctrl *gomock.Controller
 	var testStats []libvirt.DomainStats
 
-	log.Log.SetIOWriter(GinkgoWriter)
-
 	BeforeEach(func() {
 		ctrl = gomock.NewController(GinkgoT())
 		mockDomainIdent = NewMockDomainIdentifier(ctrl)
-		testStats, _ = loadStats("domstats.json")
+		testStats, _ = util.LoadStats()
 	})
 
 	Context("on conversion attempt", func() {
 		It("should handle empty input", func() {
 			in := &libvirt.DomainStats{}
 			inMem := []libvirt.DomainMemoryStat{}
+			devAliasMap := make(map[string]string)
+			inJobInfo := &stats.DomainJobInfo{MemDirtyRate: 123}
 			out := stats.DomainStats{}
 			mockDomainIdent.EXPECT().GetName().Return("testName", nil)
 			mockDomainIdent.EXPECT().GetUUIDString().Return("testUUID", nil)
 			ident := DomainIdentifier(mockDomainIdent)
 
-			err := Convert_libvirt_DomainStats_to_stats_DomainStats(ident, in, inMem, &out)
+			Expect(Convert_libvirt_DomainStats_to_stats_DomainStats(ident, in, inMem, nil, devAliasMap, inJobInfo, &out)).
+				To(Succeed())
 
-			Expect(err).To(BeNil())
 			Expect(out.Name).To(Equal("testName"))
 			Expect(out.UUID).To(Equal("testUUID"))
 		})
@@ -68,81 +68,52 @@ var _ = Describe("StatsConverter", func() {
 		It("should handle valid input", func() {
 			in := &testStats[0]
 			inMem := []libvirt.DomainMemoryStat{}
+			devAliasMap := make(map[string]string)
+			inJobInfo := &stats.DomainJobInfo{}
 			out := stats.DomainStats{}
 			mockDomainIdent.EXPECT().GetName().Return("testName", nil)
 			mockDomainIdent.EXPECT().GetUUIDString().Return("testUUID", nil)
 			ident := DomainIdentifier(mockDomainIdent)
 
-			err := Convert_libvirt_DomainStats_to_stats_DomainStats(ident, in, inMem, &out)
+			Expect(Convert_libvirt_DomainStats_to_stats_DomainStats(ident, in, inMem, nil, devAliasMap, inJobInfo, &out)).
+				To(Succeed())
 
-			Expect(err).To(BeNil())
 			// very very basic sanity check
 			Expect(out.Cpu).To(Not(BeNil()))
 			Expect(out.Memory).To(Not(BeNil()))
-			Expect(len(out.Vcpu)).To(Equal(len(testStats[0].Vcpu)))
-			Expect(len(out.Net)).To(Equal(len(testStats[0].Net)))
-			Expect(len(out.Block)).To(Equal(len(testStats[0].Block)))
+			Expect(out.MigrateDomainJobInfo).To(Not(BeNil()))
+			Expect(out.Vcpu).To(HaveLen(len(testStats[0].Vcpu)))
+			Expect(out.Net).To(HaveLen(len(testStats[0].Net)))
+			Expect(out.Block).To(HaveLen(len(testStats[0].Block)))
 		})
 
 		It("should convert valid input", func() {
 			in := &testStats[0]
 			inMem := []libvirt.DomainMemoryStat{}
+			devAliasMap := make(map[string]string)
+			inJobInfo := stats.DomainJobInfo{}
 			out := stats.DomainStats{}
 			mockDomainIdent.EXPECT().GetName().Return("testName", nil)
 			mockDomainIdent.EXPECT().GetUUIDString().Return("testUUID", nil)
 			ident := DomainIdentifier(mockDomainIdent)
 
-			err := Convert_libvirt_DomainStats_to_stats_DomainStats(ident, in, inMem, &out)
-
-			Expect(err).To(BeNil())
+			Expect(Convert_libvirt_DomainStats_to_stats_DomainStats(ident, in, inMem, nil, devAliasMap, &inJobInfo, &out)).
+				To(Succeed())
 
 			loaded := new(bytes.Buffer)
 			enc := json.NewEncoder(loaded)
-			err = enc.Encode(out)
-			Expect(err).To(BeNil())
+			Expect(enc.Encode(out)).To(Succeed())
 
-			equal, err := JSONCompareWithFile(loaded, "domstats_expected.json")
-			Expect(err).To(BeNil())
+			equal, err := JSONEqual(loaded, strings.NewReader(util.Testdataexpected))
+			Expect(err).ToNot(HaveOccurred())
 			if !equal {
 				enc := json.NewEncoder(os.Stderr)
-				err = enc.Encode(out)
-				Expect(err).To(BeNil())
+				Expect(enc.Encode(out)).To(Succeed())
 			}
 			Expect(equal).To(BeTrue())
 		})
 	})
 })
-
-func loadFile(path string) ([]byte, error) {
-	fh, err := os.Open(path)
-	if err != nil {
-		return []byte{}, err
-	}
-	defer fh.Close()
-	return ioutil.ReadAll(fh)
-}
-
-func loadStats(path string) ([]libvirt.DomainStats, error) {
-	ret := []libvirt.DomainStats{}
-	data, err := loadFile(path)
-	if err != nil {
-		return ret, err
-	}
-
-	buf := bytes.NewBuffer(data)
-	dec := json.NewDecoder(buf)
-	err = dec.Decode(&ret)
-	return ret, err
-}
-
-func JSONCompareWithFile(buf io.Reader, path string) (bool, error) {
-	fh, err := os.Open(path)
-	if err != nil {
-		return false, err
-	}
-	defer fh.Close()
-	return JSONEqual(buf, fh)
-}
 
 func JSONEqual(a, b io.Reader) (bool, error) {
 	var j, j2 interface{}
@@ -154,5 +125,5 @@ func JSONEqual(a, b io.Reader) (bool, error) {
 	if err := d.Decode(&j2); err != nil {
 		return false, err
 	}
-	return reflect.DeepEqual(j2, j), nil
+	return equality.Semantic.DeepEqual(j2, j), nil
 }

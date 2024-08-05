@@ -19,27 +19,90 @@
 
 package ephemeraldiskutils
 
+//go:generate mockgen -source $GOFILE -package=$GOPACKAGE -destination=generated_mock_$GOFILE
+
 import (
-	"bytes"
-	"crypto/md5"
-	"io"
+	"errors"
+	"fmt"
 	"os"
 	"os/user"
-	"path/filepath"
 	"strconv"
-	"strings"
+	"syscall"
 
-	v1 "kubevirt.io/kubevirt/pkg/api/v1"
-	"kubevirt.io/kubevirt/pkg/log"
+	"kubevirt.io/kubevirt/pkg/safepath"
+	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/api"
 )
 
-func RemoveFile(path string) error {
-	err := os.RemoveAll(path)
-	if err != nil && os.IsNotExist(err) {
-		return nil
-	} else if err != nil {
-		log.Log.Reason(err).Errorf("failed to remove %s", path)
+// TODO this should be part of structs, instead of a global
+var DefaultOwnershipManager OwnershipManagerInterface = &OwnershipManager{user: "qemu"}
+
+// For testing
+func MockDefaultOwnershipManager() {
+	DefaultOwnershipManager = &nonOpManager{}
+}
+
+type nonOpManager struct {
+}
+
+func (no *nonOpManager) UnsafeSetFileOwnership(file string) error {
+	return nil
+}
+
+func (no *nonOpManager) SetFileOwnership(file *safepath.Path) error {
+	return nil
+}
+
+type OwnershipManager struct {
+	user string
+}
+
+func (om *OwnershipManager) SetFileOwnership(file *safepath.Path) error {
+	fd, err := safepath.OpenAtNoFollow(file)
+	if err != nil {
 		return err
+	}
+	defer fd.Close()
+	return om.UnsafeSetFileOwnership(fd.SafePath())
+}
+
+func (om *OwnershipManager) UnsafeSetFileOwnership(file string) error {
+	owner, err := user.Lookup(om.user)
+	if err != nil {
+		return fmt.Errorf("failed to look up user %s: %v", om.user, err)
+	}
+
+	uid, err := strconv.Atoi(owner.Uid)
+	if err != nil {
+		return fmt.Errorf("failed to convert UID %s of user %s: %v", owner.Uid, om.user, err)
+	}
+
+	gid, err := strconv.Atoi(owner.Gid)
+	if err != nil {
+		return fmt.Errorf("failed to convert GID %s of user %s: %v", owner.Gid, om.user, err)
+	}
+	fileInfo, err := os.Stat(file)
+	if err != nil {
+		return err
+	}
+
+	if stat, ok := fileInfo.Sys().(*syscall.Stat_t); ok {
+		if uid == int(stat.Uid) && gid == int(stat.Gid) {
+			return nil
+		}
+	} else {
+		return fmt.Errorf("failed to convert stat info")
+	}
+
+	return os.Chown(file, uid, gid)
+}
+
+func RemoveFilesIfExist(paths ...string) error {
+	var err error
+	for _, path := range paths {
+		err = os.Remove(path)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
 	}
 	return nil
 }
@@ -49,120 +112,26 @@ func FileExists(path string) (bool, error) {
 
 	if err == nil {
 		exists = true
-	} else if os.IsNotExist(err) {
+	} else if errors.Is(err, os.ErrNotExist) {
 		err = nil
 	}
 	return exists, err
 }
-func Md5CheckSum(filePath string) ([]byte, error) {
 
-	file, err := os.Open(filePath)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	hash := md5.New()
-	_, err = io.Copy(hash, file)
-
-	if err != nil {
-		return nil, err
-	}
-
-	result := hash.Sum(nil)
-	return result, nil
+type OwnershipManagerInterface interface {
+	// Deprecated: UnsafeSetFileOwnership should not be used. Use SetFileOwnership instead.
+	UnsafeSetFileOwnership(file string) error
+	SetFileOwnership(file *safepath.Path) error
 }
 
-func SetFileOwnership(username string, file string) error {
-	usrObj, err := user.Lookup(username)
-	if err != nil {
-		log.Log.Reason(err).Errorf("unable to look up username %s", username)
-		return err
-	}
-
-	uid, err := strconv.Atoi(usrObj.Uid)
-	if err != nil {
-		log.Log.Reason(err).Errorf("unable to find uid for username %s", username)
-		return err
-	}
-
-	gid, err := strconv.Atoi(usrObj.Gid)
-	if err != nil {
-		log.Log.Reason(err).Errorf("unable to find gid for username %s", username)
-		return err
-	}
-
-	return os.Chown(file, uid, gid)
-}
-
-func FilesAreEqual(path1 string, path2 string) (bool, error) {
-	exists, err := FileExists(path1)
-	if err != nil {
-		log.Log.Reason(err).Errorf("unexpected error encountered while attempting to determine if %s exists", path1)
-		return false, err
-	} else if exists == false {
-		return false, nil
-	}
-
-	exists, err = FileExists(path2)
-	if err != nil {
-		log.Log.Reason(err).Errorf("unexpected error encountered while attempting to determine if %s exists", path2)
-		return false, err
-	} else if exists == false {
-		return false, nil
-	}
-
-	sum1, err := Md5CheckSum(path1)
-	if err != nil {
-		log.Log.Reason(err).Errorf("calculating md5 checksum failed for %s", path1)
-		return false, err
-	}
-	sum2, err := Md5CheckSum(path2)
-	if err != nil {
-		log.Log.Reason(err).Errorf("calculating md5 checksum failed for %s", path2)
-		return false, err
-	}
-
-	return bytes.Equal(sum1, sum2), nil
-}
-
-// Lists all vmis ephemeral disk has local data for
-func ListVmWithEphemeralDisk(localPath string) ([]*v1.VirtualMachineInstance, error) {
-	var keys []*v1.VirtualMachineInstance
-
-	exists, err := FileExists(localPath)
-	if err != nil {
-		return nil, err
-	}
-	if exists == false {
-		return nil, nil
-	}
-
-	err = filepath.Walk(localPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
+func GetEphemeralBackingSourceBlockDevices(domain *api.Domain) map[string]bool {
+	isDevEphemeralBackingSource := make(map[string]bool)
+	for _, disk := range domain.Spec.Devices.Disks {
+		if disk.BackingStore != nil && disk.BackingStore.Source != nil {
+			if disk.BackingStore.Type == "block" && disk.BackingStore.Source.Dev != "" && disk.BackingStore.Source.Name != "" {
+				isDevEphemeralBackingSource[disk.BackingStore.Source.Name] = true
+			}
 		}
-		if info.IsDir() == false {
-			return nil
-		}
-
-		relativePath := strings.TrimPrefix(path, localPath+"/")
-		if relativePath == "" {
-			return nil
-		}
-		dirs := strings.Split(relativePath, "/")
-		if len(dirs) != 2 {
-			return nil
-		}
-
-		namespace := dirs[0]
-		domain := dirs[1]
-		if namespace == "" || domain == "" {
-			return nil
-		}
-		keys = append(keys, v1.NewVMIReferenceFromNameWithNS(dirs[0], dirs[1]))
-		return nil
-	})
-
-	return keys, err
+	}
+	return isDevEphemeralBackingSource
 }

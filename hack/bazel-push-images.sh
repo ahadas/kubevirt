@@ -20,13 +20,74 @@
 set -e
 
 source hack/common.sh
+source hack/bootstrap.sh
 source hack/config.sh
 
+default_targets="
+    virt-operator
+    virt-api
+    virt-controller
+    virt-handler
+    virt-launcher
+    virt-exportserver
+    virt-exportproxy
+    conformance
+    libguestfs-tools
+    pr-helper
+    example-hook-sidecar
+    example-disk-mutation-hook-sidecar
+    example-cloudinit-hook-sidecar
+    alpine-container-disk-demo
+    cirros-container-disk-demo
+    cirros-custom-container-disk-demo
+    virtio-container-disk
+    alpine-ext-kernel-boot-demo
+    fedora-with-test-tooling-container-disk
+    alpine-with-test-tooling-container-disk
+    fedora-realtime-container-disk
+    disks-images-provider
+    nfs-server
+    vm-killer
+    winrmcli
+    sidecar-shim
+    network-slirp-binding
+    network-passt-binding
+"
+
+PUSH_TARGETS=(${PUSH_TARGETS:-${default_targets}})
+
 for tag in ${docker_tag} ${docker_tag_alt}; do
-    bazel run \
-        --platforms=@io_bazel_rules_go//go/toolchain:linux_amd64 \
-        --workspace_status_command=./hack/print-workspace-status.sh \
-        --define container_prefix=${docker_prefix} \
-        --define container_tag=${tag} \
-        //:push-images
+    for target in ${PUSH_TARGETS[@]}; do
+
+        bazel run \
+            --config=${ARCHITECTURE} \
+            --define container_prefix=${docker_prefix} \
+            --define image_prefix=${image_prefix} \
+            --define container_tag=${tag} \
+            //:push-${target}
+
+    done
+done
+
+# for the imagePrefix operator test
+if [[ $image_prefix_alt ]]; then
+    for target in ${PUSH_TARGETS[@]}; do
+
+        bazel run \
+            --config=${ARCHITECTURE} \
+            --define container_prefix=${docker_prefix} \
+            --define image_prefix=${image_prefix_alt} \
+            --define container_tag=${docker_tag} \
+            //:push-${target}
+
+    done
+fi
+
+rm -rf ${DIGESTS_DIR}/${ARCHITECTURE}
+mkdir -p ${DIGESTS_DIR}/${ARCHITECTURE}
+
+for f in $(find bazel-bin/ -name '*.digest'); do
+    dir=${DIGESTS_DIR}/${ARCHITECTURE}/$(dirname $f)
+    mkdir -p ${dir}
+    cp -f ${f} ${dir}/$(basename ${f})
 done

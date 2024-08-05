@@ -37,7 +37,7 @@ The mechanism proposed in this proposal is leveraging Kubernetes to attach
 the remote storage as a file-system to a container, to use this file-system to
 store a disk image to act as a backend storage to the VMI's disk.
 
-To keep the story compatability between the block and file-system storage, this
+To keep the story compatibility between the block and file-system storage, this
 proposal assumes that the file-system based storage will also just support a 1:1
 mapping between the virtual disk and volume.
 This aligns with the fact that a block volume can also just back a single
@@ -77,7 +77,7 @@ VMI.
 
 The system needs to know if the referenced volume needs to be treated as a
 block or file-system volume.
-Since Kubernetes 1.9 this information can be infered from the existing PV
+Since Kubernetes 1.9 this information can be inferred from the existing PV
 metadata.
 
 

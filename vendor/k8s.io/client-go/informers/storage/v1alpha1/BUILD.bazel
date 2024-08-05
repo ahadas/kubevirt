@@ -3,8 +3,10 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library")
 go_library(
     name = "go_default_library",
     srcs = [
+        "csistoragecapacity.go",
         "interface.go",
         "volumeattachment.go",
+        "volumeattributesclass.go",
     ],
     importmap = "kubevirt.io/kubevirt/vendor/k8s.io/client-go/informers/storage/v1alpha1",
     importpath = "k8s.io/client-go/informers/storage/v1alpha1",

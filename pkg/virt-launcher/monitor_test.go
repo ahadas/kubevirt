@@ -21,8 +21,6 @@ package virtlauncher
 
 import (
 	"flag"
-	"io/ioutil"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -30,42 +28,34 @@ import (
 	"syscall"
 	"time"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"kubevirt.io/kubevirt/pkg/log"
+	"github.com/google/uuid"
 )
 
 var fakeQEMUBinary string
 
 func init() {
 	flag.StringVar(&fakeQEMUBinary, "fake-qemu-binary-path", "_out/cmd/fake-qemu-process/fake-qemu-process", "path to cirros test image")
-	flag.Parse()
-	fakeQEMUBinary = filepath.Join("../../", fakeQEMUBinary)
 }
 
 var _ = Describe("VirtLauncher", func() {
 	var mon *monitor
 	var cmd *exec.Cmd
 	var cmdLock sync.Mutex
-
-	uuid := "123-123-123-123"
-
-	tmpDir, _ := ioutil.TempDir("", "monitortest")
-
-	log.Log.SetIOWriter(GinkgoWriter)
-
-	dir := os.Getenv("PWD")
-	dir = strings.TrimSuffix(dir, "pkg/virt-launcher")
-
-	processStarted := false
+	var gracefulShutdownChannel chan struct{}
+	var fakeUuid string
+	var pidDir string
+	var processStarted bool
+	var err error
 
 	StartProcess := func() {
 		cmdLock.Lock()
 		defer cmdLock.Unlock()
 
-		cmd = exec.Command(fakeQEMUBinary, "--uuid", uuid)
-		err := cmd.Start()
+		cmd = exec.Command(fakeQEMUBinary, "--uuid", fakeUuid, "--pidfile", filepath.Join(pidDir, "fakens_fakevmi.pid"))
+		err = cmd.Start()
 		Expect(err).ToNot(HaveOccurred())
 
 		currentPid := cmd.Process.Pid
@@ -79,6 +69,7 @@ var _ = Describe("VirtLauncher", func() {
 		defer cmdLock.Unlock()
 
 		cmd.Process.Kill()
+
 		processStarted = false
 	}
 
@@ -116,28 +107,40 @@ var _ = Describe("VirtLauncher", func() {
 	}
 
 	BeforeEach(func() {
-		InitializeSharedDirectories(tmpDir)
-		triggerFile := GracefulShutdownTriggerFromNamespaceName(tmpDir, "fakenamespace", "fakedomain")
+		fakeUuid = uuid.New().String()
+		pidDir = GinkgoT().TempDir()
+
+		processStarted = false
+		if !strings.Contains(fakeQEMUBinary, "../../") {
+			fakeQEMUBinary = filepath.Join("../../", fakeQEMUBinary)
+		}
+		gracefulShutdownChannel = make(chan struct{})
 		shutdownCallback := func(pid int) {
-			syscall.Kill(pid, syscall.SIGTERM)
+			// Don't send SIGTERM to the current process group (i.e. to PID 0). That will interrupt
+			// the test run.
+			Expect(pid).ToNot(BeZero())
+			err := syscall.Kill(pid, syscall.SIGTERM)
+			Expect(err).ToNot(HaveOccurred())
+		}
+		gracefulShutdownCallback := func() {
+			close(gracefulShutdownChannel)
 		}
 		mon = &monitor{
-			cmdlineMatchStr:             uuid,
-			gracePeriod:                 30,
-			gracefulShutdownTriggerFile: triggerFile,
-			shutdownCallback:            shutdownCallback,
+			domainName:               "fakens_fakevmi",
+			pidDir:                   pidDir,
+			gracePeriod:              30,
+			finalShutdownCallback:    shutdownCallback,
+			gracefulShutdownCallback: gracefulShutdownCallback,
 		}
 	})
 
 	AfterEach(func() {
-		os.RemoveAll(tmpDir)
 		if processStarted == true {
-			cmdLock.Lock()
-			defer cmdLock.Unlock()
-			cmd.Process.Kill()
+			StopProcess()
+			CleanupProcess()
 		}
-		processStarted = false
 	})
+
 	Describe("VirtLauncher", func() {
 		Context("process monitor", func() {
 			It("verify pid detection works", func() {
@@ -148,11 +151,22 @@ var _ = Describe("VirtLauncher", func() {
 				VerifyProcessStopped()
 			})
 
+			It("verify zombie pid detection works", func() {
+				StartProcess()
+				VerifyProcessStarted()
+				StopProcess()
+				VerifyProcessStopped()
+
+				// cleanup after stopping ensures zombie process is detected
+				CleanupProcess()
+			})
+
 			It("verify start timeout works", func() {
 				stopChan := make(chan struct{})
 				done := make(chan string)
 
 				go func() {
+					defer GinkgoRecover()
 					mon.RunForever(time.Second, stopChan)
 					done <- "exit"
 				}()
@@ -165,7 +179,7 @@ var _ = Describe("VirtLauncher", func() {
 					exited = true
 				}
 
-				Expect(exited).To(Equal(true))
+				Expect(exited).To(BeTrue())
 			})
 
 			It("verify monitor loop exits when signal arrives and no pid is present", func() {
@@ -173,6 +187,7 @@ var _ = Describe("VirtLauncher", func() {
 				done := make(chan string)
 
 				go func() {
+					defer GinkgoRecover()
 					mon.monitorLoop(1*time.Second, stopChan)
 					done <- "exit"
 				}()
@@ -189,7 +204,7 @@ var _ = Describe("VirtLauncher", func() {
 					exited = true
 				}
 
-				Expect(exited).To(Equal(true))
+				Expect(exited).To(BeTrue())
 			})
 
 			It("verify graceful shutdown trigger works", func() {
@@ -201,23 +216,14 @@ var _ = Describe("VirtLauncher", func() {
 				go func() { CleanupProcess() }()
 
 				go func() {
+					defer GinkgoRecover()
 					mon.monitorLoop(1*time.Second, stopChan)
 					done <- "exit"
 				}()
 
-				time.Sleep(time.Second)
-
-				exists, err := hasGracefulShutdownTrigger(tmpDir, "fakenamespace", "fakedomain")
-				Expect(err).ToNot(HaveOccurred())
-				Expect(exists).To(Equal(false))
-
+				Consistently(gracefulShutdownChannel).Should(Not(BeClosed()))
 				close(stopChan)
-
-				time.Sleep(time.Second)
-
-				exists, err = hasGracefulShutdownTrigger(tmpDir, "fakenamespace", "fakedomain")
-				Expect(err).ToNot(HaveOccurred())
-				Expect(exists).To(Equal(true))
+				Eventually(gracefulShutdownChannel).Should(BeClosed())
 			})
 
 			It("verify grace period works", func() {
@@ -228,13 +234,14 @@ var _ = Describe("VirtLauncher", func() {
 				VerifyProcessStarted()
 				go func() { CleanupProcess() }()
 				go func() {
+					defer GinkgoRecover()
 					mon.gracePeriod = 1
 					mon.monitorLoop(1*time.Second, stopChan)
 					done <- "exit"
 				}()
 
 				close(stopChan)
-				noExitCheck := time.After(5 * time.Second)
+				noExitCheck := time.After(10 * time.Second)
 				exited := false
 
 				select {
@@ -243,7 +250,7 @@ var _ = Describe("VirtLauncher", func() {
 					exited = true
 				}
 
-				Expect(exited).To(Equal(true))
+				Expect(exited).To(BeTrue())
 			})
 		})
 	})

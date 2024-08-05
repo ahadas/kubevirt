@@ -21,43 +21,45 @@ package ignition
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	v1 "kubevirt.io/kubevirt/pkg/api/v1"
+	"kubevirt.io/client-go/api"
+
+	v1 "kubevirt.io/api/core/v1"
 )
+
+var tmpDir string
+
+var _ = BeforeSuite(func() {
+	var err error
+	tmpDir, err = os.MkdirTemp("", "ignitiontest")
+	Expect(err).ToNot(HaveOccurred())
+	DeferCleanup(os.RemoveAll, tmpDir)
+
+	err = SetLocalDirectory(tmpDir)
+	Expect(err).ToNot(HaveOccurred())
+})
 
 var _ = Describe("Ignition", func() {
 
 	const vmName = "my-vm"
 	const namespace = "my-namespace"
-	tmpDir, _ := ioutil.TempDir("", "ignitiontest")
+
 	// const ignitionLocalDir = "/var/run/libvirt/ignition-dir"
 	var vmi *v1.VirtualMachineInstance
 
-	BeforeSuite(func() {
-		err := SetLocalDirectory(tmpDir)
-		if err != nil {
-			panic(err)
-		}
-	})
-
-	AfterSuite(func() {
-		os.RemoveAll(tmpDir)
-	})
-
 	Describe("A new VirtualMachineInstance definition", func() {
 		Context("with ignition data", func() {
-			vmi = v1.NewMinimalVMI(vmName)
+			vmi = api.NewMinimalVMI(vmName)
 			It("should success", func() {
 				data := "{ \"ignition\": { \"config\": {}, \"version\": \"2.2.0\" }, \"networkd\": {}, \"storage\": { \"files\": [ { \"contents\": { \"source\": \"data:,test\", \"verification\": {} }, \"filesystem\": \"root\", \"mode\": 420, \"path\": \"/etc/hostname\" } ] }, \"systemd\": {} }"
 				vmi.Annotations = map[string]string{v1.IgnitionAnnotation: data}
 				err := GenerateIgnitionLocalData(vmi, namespace)
 				Expect(err).ToNot(HaveOccurred())
-				_, err = os.Stat(fmt.Sprintf("%s/%s/%s/data.ign", tmpDir, namespace, vmName))
+				_, err = os.Stat(fmt.Sprintf("%s/%s/%s/%s", tmpDir, namespace, vmName, IgnitionFile))
 				Expect(err).ToNot(HaveOccurred())
 			})
 		})

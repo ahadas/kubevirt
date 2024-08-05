@@ -20,129 +20,160 @@
 package mutators
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
+	"time"
 
-	"k8s.io/api/admission/v1beta1"
-	k8sv1 "k8s.io/api/core/v1"
+	admissionv1 "k8s.io/api/admission/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/cache"
 
-	v1 "kubevirt.io/kubevirt/pkg/api/v1"
-	"kubevirt.io/kubevirt/pkg/log"
+	v1 "kubevirt.io/api/core/v1"
+	"kubevirt.io/client-go/log"
+
+	"kubevirt.io/kubevirt/pkg/apimachinery/patch"
+	kvpointer "kubevirt.io/kubevirt/pkg/pointer"
+	"kubevirt.io/kubevirt/pkg/util"
+	webhookutils "kubevirt.io/kubevirt/pkg/util/webhooks"
 	"kubevirt.io/kubevirt/pkg/virt-api/webhooks"
 	virtconfig "kubevirt.io/kubevirt/pkg/virt-config"
 )
 
 type VMIsMutator struct {
-	ClusterConfig *virtconfig.ClusterConfig
+	ClusterConfig           *virtconfig.ClusterConfig
+	VMIPresetInformer       cache.SharedIndexInformer
+	KubeVirtServiceAccounts map[string]struct{}
 }
 
-func (mutator *VMIsMutator) Mutate(ar *v1beta1.AdmissionReview) *v1beta1.AdmissionResponse {
-	if ar.Request.Resource != webhooks.VirtualMachineInstanceGroupVersionResource {
+const presetDeprecationWarning = "kubevirt.io/v1 VirtualMachineInstancePresets is now deprecated and will be removed in v2."
+
+func (mutator *VMIsMutator) Mutate(ar *admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
+	if !webhookutils.ValidateRequestResource(ar.Request.Resource, webhooks.VirtualMachineInstanceGroupVersionResource.Group, webhooks.VirtualMachineInstanceGroupVersionResource.Resource) {
 		err := fmt.Errorf("expect resource to be '%s'", webhooks.VirtualMachineInstanceGroupVersionResource.Resource)
-		return webhooks.ToAdmissionResponseError(err)
+		return webhookutils.ToAdmissionResponseError(err)
 	}
 
-	if resp := webhooks.ValidateSchema(v1.VirtualMachineInstanceGroupVersionKind, ar.Request.Object.Raw); resp != nil {
+	if resp := webhookutils.ValidateSchema(v1.VirtualMachineInstanceGroupVersionKind, ar.Request.Object.Raw); resp != nil {
 		return resp
 	}
-
-	raw := ar.Request.Object.Raw
-	vmi := v1.VirtualMachineInstance{}
-
-	err := json.Unmarshal(raw, &vmi)
+	// Get new VMI from admission response
+	newVMI, oldVMI, err := webhookutils.GetVMIFromAdmissionReview(ar)
 	if err != nil {
-		return webhooks.ToAdmissionResponseError(err)
+		return webhookutils.ToAdmissionResponseError(err)
 	}
 
-	informers := webhooks.GetInformers()
+	patchSet := patch.New()
 
-	// Apply presets
-	err = applyPresets(&vmi, informers.VMIPresetInformer)
-	if err != nil {
-		return &v1beta1.AdmissionResponse{
-			Result: &metav1.Status{
-				Message: err.Error(),
-				Code:    http.StatusUnprocessableEntity,
-			},
+	// Patch the spec, metadata and status with defaults if we deal with a create operation
+	if ar.Request.Operation == admissionv1.Create {
+		// Apply presets
+		err = applyPresets(newVMI, mutator.VMIPresetInformer)
+		if err != nil {
+			return &admissionv1.AdmissionResponse{
+				Result: &metav1.Status{
+					Message: err.Error(),
+					Code:    http.StatusUnprocessableEntity,
+				},
+			}
+		}
+
+		// Set VirtualMachineInstance defaults
+		log.Log.Object(newVMI).V(4).Info("Apply defaults")
+		if err = webhooks.SetDefaultVirtualMachineInstance(mutator.ClusterConfig, newVMI); err != nil {
+			return webhookutils.ToAdmissionResponseError(err)
+		}
+
+		if newVMI.IsRealtimeEnabled() {
+			log.Log.V(4).Info("Add realtime node label selector")
+			addNodeSelector(newVMI, v1.RealtimeLabel)
+		}
+		if util.IsSEVVMI(newVMI) {
+			log.Log.V(4).Info("Add SEV node label selector")
+			addNodeSelector(newVMI, v1.SEVLabel)
+		}
+		if util.IsSEVESVMI(newVMI) {
+			log.Log.V(4).Info("Add SEV-ES node label selector")
+			addNodeSelector(newVMI, v1.SEVESLabel)
+		}
+
+		if newVMI.Spec.Domain.CPU.IsolateEmulatorThread {
+			_, emulatorThreadCompleteToEvenParityAnnotationExists := mutator.ClusterConfig.GetConfigFromKubeVirtCR().Annotations[v1.EmulatorThreadCompleteToEvenParity]
+			if emulatorThreadCompleteToEvenParityAnnotationExists &&
+				mutator.ClusterConfig.AlignCPUsEnabled() {
+				log.Log.V(4).Infof("Copy %s annotation from Kubevirt CR", v1.EmulatorThreadCompleteToEvenParity)
+				if newVMI.Annotations == nil {
+					newVMI.Annotations = map[string]string{}
+				}
+				newVMI.Annotations[v1.EmulatorThreadCompleteToEvenParity] = ""
+			}
+		}
+
+		// Add foreground finalizer
+		newVMI.Finalizers = append(newVMI.Finalizers, v1.VirtualMachineInstanceFinalizer)
+
+		// Set the phase to pending to avoid blank status
+		newVMI.Status.Phase = v1.Pending
+
+		now := metav1.NewTime(time.Now())
+		newVMI.Status.PhaseTransitionTimestamps = append(newVMI.Status.PhaseTransitionTimestamps, v1.VirtualMachineInstancePhaseTransitionTimestamp{
+			Phase:                    newVMI.Status.Phase,
+			PhaseTransitionTimestamp: now,
+		})
+
+		if !mutator.ClusterConfig.RootEnabled() {
+			util.MarkAsNonroot(newVMI)
+		}
+
+		patchSet.AddOption(
+			patch.WithReplace("/spec", newVMI.Spec),
+			patch.WithReplace("/metadata", newVMI.ObjectMeta),
+			patch.WithReplace("/status", newVMI.Status),
+		)
+
+	} else if ar.Request.Operation == admissionv1.Update {
+		// Ignore status updates if they are not coming from our service accounts
+		// TODO: As soon as CRDs support field selectors we can remove this and just enable
+		// the status subresource. Until then we need to update Status and Metadata labels in parallel for e.g. Migrations.
+		if !equality.Semantic.DeepEqual(newVMI.Status, oldVMI.Status) {
+			if _, isKubeVirtServiceAccount := mutator.KubeVirtServiceAccounts[ar.Request.UserInfo.Username]; !isKubeVirtServiceAccount {
+				patchSet.AddOption(patch.WithReplace("/status", oldVMI.Status))
+			}
+		}
+
+	}
+
+	if patchSet.IsEmpty() {
+		return &admissionv1.AdmissionResponse{
+			Allowed: true,
 		}
 	}
 
-	// Apply namespace limits
-	applyNamespaceLimitRangeValues(&vmi, informers.NamespaceLimitsInformer)
-
-	// Set VMI defaults
-	log.Log.Object(&vmi).V(4).Info("Apply defaults")
-	mutator.setDefaultCPUModel(&vmi)
-	mutator.setDefaultMachineType(&vmi)
-	mutator.setDefaultResourceRequests(&vmi)
-	v1.SetObjectDefaults_VirtualMachineInstance(&vmi)
-
-	// Add foreground finalizer
-	vmi.Finalizers = append(vmi.Finalizers, v1.VirtualMachineInstanceFinalizer)
-
-	var patch []patchOperation
-	var value interface{}
-	value = vmi.Spec
-	patch = append(patch, patchOperation{
-		Op:    "replace",
-		Path:  "/spec",
-		Value: value,
-	})
-
-	value = vmi.ObjectMeta
-	patch = append(patch, patchOperation{
-		Op:    "replace",
-		Path:  "/metadata",
-		Value: value,
-	})
-
-	patchBytes, err := json.Marshal(patch)
+	patchBytes, err := patchSet.GeneratePayload()
 	if err != nil {
-		return webhooks.ToAdmissionResponseError(err)
+		return webhookutils.ToAdmissionResponseError(err)
 	}
 
-	jsonPatchType := v1beta1.PatchTypeJSONPatch
-	return &v1beta1.AdmissionResponse{
+	response := &admissionv1.AdmissionResponse{
 		Allowed:   true,
 		Patch:     patchBytes,
-		PatchType: &jsonPatchType,
+		PatchType: kvpointer.P(admissionv1.PatchTypeJSONPatch),
 	}
-}
-
-func (mutator *VMIsMutator) setDefaultCPUModel(vmi *v1.VirtualMachineInstance) {
-	//if vmi doesn't have cpu topology or cpu model set
-	if vmi.Spec.Domain.CPU == nil || vmi.Spec.Domain.CPU.Model == "" {
-		if defaultCPUModel := mutator.ClusterConfig.GetCPUModel(); defaultCPUModel != "" {
-			// create cpu topology struct
-			if vmi.Spec.Domain.CPU == nil {
-				vmi.Spec.Domain.CPU = &v1.CPU{}
-			}
-			//set is as vmi cpu model
-			vmi.Spec.Domain.CPU.Model = defaultCPUModel
+	// If newVMI has been annotated with presets include a deprecation warning in the response
+	for annotation := range newVMI.Annotations {
+		if strings.Contains(annotation, "virtualmachinepreset") {
+			response.Warnings = []string{presetDeprecationWarning}
+			break
 		}
 	}
+
+	return response
 }
 
-func (mutator *VMIsMutator) setDefaultMachineType(vmi *v1.VirtualMachineInstance) {
-	if vmi.Spec.Domain.Machine.Type == "" {
-		vmi.Spec.Domain.Machine.Type = mutator.ClusterConfig.GetMachineType()
+func addNodeSelector(vmi *v1.VirtualMachineInstance, label string) {
+	if vmi.Spec.NodeSelector == nil {
+		vmi.Spec.NodeSelector = map[string]string{}
 	}
-}
-
-func (mutator *VMIsMutator) setDefaultResourceRequests(vmi *v1.VirtualMachineInstance) {
-	if _, exists := vmi.Spec.Domain.Resources.Requests[k8sv1.ResourceMemory]; !exists {
-		if vmi.Spec.Domain.Resources.Requests == nil {
-			vmi.Spec.Domain.Resources.Requests = k8sv1.ResourceList{}
-		}
-		vmi.Spec.Domain.Resources.Requests[k8sv1.ResourceMemory] = mutator.ClusterConfig.GetMemoryRequest()
-	}
-
-	if _, exists := vmi.Spec.Domain.Resources.Requests[k8sv1.ResourceCPU]; !exists {
-		if vmi.Spec.Domain.CPU != nil && vmi.Spec.Domain.CPU.DedicatedCPUPlacement {
-			return
-		}
-		vmi.Spec.Domain.Resources.Requests[k8sv1.ResourceCPU] = mutator.ClusterConfig.GetCPURequest()
-	}
+	vmi.Spec.NodeSelector[label] = ""
 }

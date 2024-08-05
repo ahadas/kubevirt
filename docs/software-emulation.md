@@ -9,42 +9,34 @@ in case that at least one network interface model is virtio (note: if the NIC
 model is not explicitly specified, by default virtio is chosen).
 
 If `useEmulation` is enabled,
-- hardware emulation via `/dev/kvm` will not be attempted. `qemu` will be used
-  for software emulation instead.
-- in-kernel virtio-net backend emulation via `/dev/vhost-net` will not be
-  attempted. QEMU userland virtio NIC emulation will be used for virtio-net
-  interface instead.
+- `qemu` will be used for software emulation, in case that hardware emulation
+  via `/dev/kvm` is unavailable.
+- QEMU userland virtio NIC emulation will be used for virtio-net interfaces,
+  in case that in-kernel virtio-net backend emulation via `/dev/vhost-net` 
+  is unavailable.
+
+If `useEmulation` is disabled, and a required hardware emulation device is unavailable
+(`/dev/kvm`, or `/dev/vhost-net` for a VirtualMachine which uses virtio for at least one interface),
+the VirtualMachine will fail to start and an error will be reported.
+
+Note that software emulation, when enabled, is only used as a fallback when
+hardware emulation is not available. Hardware emulation is always attempted first,
+regardless of the value of the `useEmulation`.
 
 # Configuration
 
-Enabling software emulation is a cluster-wide setting, and is activated using a
-ConfigMap in the `kubevirt` namespace. It can be enabled with the following
-command:
+Enabling software emulation is a cluster-wide setting, and is activated by
+editing the `KubeVirt` CR as follows:
 
 ```bash
-cluster/kubectl.sh --namespace kubevirt create configmap kubevirt-config \
-    --from-literal debug.useEmulation=true
+cluster-up/kubectl.sh --namespace kubevirt edit kubevirt kubevirt
 ```
 
-If the `kubevirt/kubevirt-config` ConfigMap already exists, the above entry
-can be added using:
-
-```bash
-cluster/kubectl.sh --namespace kubevirt edit configmap kubevirt-config
-```
-
-In this case, add the `debug.useEmulation: "true"` setting to `data`:
+Add the following snippet to the spec:
 
 ```yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: kubevirt-config
-  namespace: kubevirt
-data:
-  debug.useEmulation: "true"
-
+spec:
+  configuration:
+    developerConfiguration:
+      useEmulation: true
 ```
-
-**NOTE**: The values of `ConfigMap.data` are **strings**. Yaml requires the use of
-quotes around `"true"` to distinguish the value from a boolean.

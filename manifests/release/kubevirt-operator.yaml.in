@@ -4,8 +4,17 @@ kind: Namespace
 metadata:
   labels:
     kubevirt.io: ""
+    pod-security.kubernetes.io/enforce: "privileged"
   name: {{.Namespace}}
 {{index .GeneratedManifests "kv-resource.yaml"}}
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: kubevirt-cluster-critical
+value: 1000000000
+globalDefault: false
+description: "This priority class should be used for core kubevirt components only."
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -29,4 +38,13 @@ rules:
       - watch
       - deletecollection
 {{index .GeneratedManifests "rbac-operator.authorization.k8s.yaml.in"}}
-{{index .GeneratedManifests "virt-operator.yaml.in"}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    kubevirt.io: virt-operator
+  name: virt-operator
+  namespace: {{.Namespace}}
+spec:
+{{.OperatorDeploymentSpec}}

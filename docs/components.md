@@ -28,7 +28,7 @@ choreography, where all components act by themselves to realize the state
 provided by the `VMI` objects.
 
 ```
-Client                     K8s API     VMI CRD  Virt Controller         VMI Handler
+Client                     K8s API     VMI CR  Virt Controller         VMI Handler
 -------------------------- ----------- ------- ----------------------- ----------
 
                            listen <----------- WATCH /virtualmachines
@@ -60,10 +60,9 @@ there are _temporary workarounds_ in place to avoid bugs and address some
 other stuff.
 
 1. A client posts a new VMI definition to the K8s API Server.
-2. The K8s API Server validates the input and creates a `VMI` custom resource
-   definition (CRD) object.
+2. The K8s API Server validates the input and creates a `VMI` custom resource.
 3. The `virt-controller` observes the creation of the new `VMI` object
-   and creates a corrsponding pod.
+   and creates a corresponding pod.
 4. Kubernetes is scheduling the pod on a host.
 5. The `virt-controller` observes that a pod for the `VMI` got started and
    updates the `nodeName` field in the`VMI` object.
@@ -88,7 +87,7 @@ As the main entrypoint to KubeVirt it is responsible for defaulting and validati
 
 ## `VMI` (CRD)
 
-VMI definitions are kept as custom resource definitions inside the Kubernetes API
+VMI definitions are kept as custom resources inside the Kubernetes API
 server.
 
 The VMI definition is defining all properties of the Virtual machine itself,
@@ -105,7 +104,7 @@ for example
 From a high-level perspective the virt-controller has all the _cluster wide_
 virtualization functionality.
 
-This controller is responsible for monitoring the VMI (CRDs) and managing the
+This controller is responsible for monitoring the VMI (CRs) and managing the
 associated pods. Currently the controller will make sure to create and manage
 the life-cycle of the pods associated to the VMI objects.
 
@@ -173,11 +172,11 @@ functionality is not provided by kubernetes itself.
 We will try to leverage as much of Kubernetes regarding to mounting and preparing images for VMI.
 However, `virt-handler` may provide a plugin mechanism to allow storage mounting and setup from the host, if the KubeVirt requirements do not fit into the Kubernetes storage scenarios.
 
-Since host side preparation of storage may not be enough, a cluster-wide [Storage Controller](###storage-controller) can be used to prepare storage.
+Since host side preparation of storage may not be enough, a cluster-wide [Storage Controller](#storage-controller) can be used to prepare storage.
 
 Investigations are still in progress.
 
-###  Storage Controller
+### Storage Controller
 
 Such a controller will not be part of KubeVirt itself.
 
@@ -185,15 +184,24 @@ However KubeVirt might define a Storage CRD along side with a flow description w
 
 ## Networking
 
-We will try to leverage as much of Kubernetes networking plugin mechanisms (e.g. CNI).
-However, `virt-handler` may provide a plugin mechanism to allow network setup on a host, if the KubeVirt requirements do not fit into the Kubernetes storage scenarios.
+KubeVirt aims to seamlessly integrate into Kubernetes networking, with VMs
+connected to the same network as Pods, using the same resources and same APIs.
+Without any external extensions, VMs in KubeVirt are capable of using the pod
+network, Services, or NetworkPolicies.
 
-Since host side preparation of network interfaces may not be enough, a cluster-wide [Network Controller](###network-controller) can be used to prepare the network.
+To implement this, VMs are only bound to network resources that are made
+available to the virt-launcher Pod's network namespace. With this model, a wide
+variety of networking plugins can be supported.
 
-Investigations are still in progress.
+We also care for advanced networking scenarios, such as connecting to service
+meshes, multiple network interfaces, SR-IOV, or MAC address pooling. To
+implement integration with these technologies, we are following the [KubeVirt
+Razor](architecture.md#the-razor), attempting to reuse existing
+container-focused technologies as much as is possible.
 
-## Network Controller
+You can find more information about this topic, including examples of specific
+plugins and extensions, in the user-guide:
 
-Such a controller will not be part of KubeVirt itself.
-
-However KubeVirt might define a Networking CRD along side with a flow description which will allow such a controller seamless integration into KubeVirt.
+* [Interfaces and Networks](https://kubevirt.io/user-guide/virtual_machines/interfaces_and_networks/)
+* [NetworkPolicy](https://kubevirt.io/user-guide/virtual_machines/networkpolicy/)
+* [Service Mesh](https://kubevirt.io/user-guide/virtual_machines/istio_service_mesh/)

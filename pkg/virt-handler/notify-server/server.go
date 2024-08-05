@@ -20,11 +20,12 @@
 package eventsserver
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 
 	k8sv1 "k8s.io/api/core/v1"
@@ -34,9 +35,10 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 
-	v1 "kubevirt.io/kubevirt/pkg/api/v1"
+	v1 "kubevirt.io/api/core/v1"
+	"kubevirt.io/client-go/log"
+
 	notifyv1 "kubevirt.io/kubevirt/pkg/handler-launcher-com/notify/v1"
-	"kubevirt.io/kubevirt/pkg/log"
 	grpcutil "kubevirt.io/kubevirt/pkg/util/net/grpc"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/api"
 )
@@ -47,7 +49,7 @@ type Notify struct {
 	vmiStore  cache.Store
 }
 
-func (n *Notify) HandleDomainEvent(ctx context.Context, request *notifyv1.DomainEventRequest) (*notifyv1.Response, error) {
+func (n *Notify) HandleDomainEvent(_ context.Context, request *notifyv1.DomainEventRequest) (*notifyv1.Response, error) {
 	response := &notifyv1.Response{
 		Success: true,
 	}
@@ -74,7 +76,7 @@ func (n *Notify) HandleDomainEvent(ctx context.Context, request *notifyv1.Domain
 		}
 	}
 
-	log.Log.Infof("Received Domain Event of type %s", request.EventType)
+	log.Log.Object(domain).V(3).Infof("Received Domain Event of type %s", request.EventType)
 	switch request.EventType {
 	case string(watch.Added):
 		n.EventChan <- watch.Event{Type: watch.Added, Object: domain}
@@ -83,12 +85,13 @@ func (n *Notify) HandleDomainEvent(ctx context.Context, request *notifyv1.Domain
 	case string(watch.Deleted):
 		n.EventChan <- watch.Event{Type: watch.Deleted, Object: domain}
 	case string(watch.Error):
+		log.Log.Object(domain).Errorf("Domain error event with message: %s", status.Message)
 		n.EventChan <- watch.Event{Type: watch.Error, Object: status}
 	}
 	return response, nil
 }
 
-func (n *Notify) HandleK8SEvent(ctx context.Context, request *notifyv1.K8SEventRequest) (*notifyv1.Response, error) {
+func (n *Notify) HandleK8SEvent(_ context.Context, request *notifyv1.K8SEventRequest) (*notifyv1.Response, error) {
 	response := &notifyv1.Response{
 		Success: true,
 	}
@@ -154,11 +157,29 @@ func RunServer(virtShareDir string, stopChan chan struct{}, c chan watch.Event, 
 	case <-done:
 		log.Log.Info("notify server done")
 	case <-stopChan:
-		log.Log.Info("stopping notify server")
-		grpcServer.Stop()
-		sock.Close()
-		os.Remove(sockFile)
+		grpcServerStop(grpcServer)
 	}
 
 	return nil
+}
+
+func grpcServerStop(grpcServer *grpc.Server) {
+	gracefulShutdownTimeout := 10
+
+	isStopped := make(chan struct{})
+	go func() {
+		grpcServer.GracefulStop()
+		close(isStopped)
+	}()
+
+	t := time.NewTimer(time.Second * time.Duration(gracefulShutdownTimeout))
+	defer t.Stop()
+
+	select {
+	case <-t.C:
+		log.Log.Infof("notify server GracefulStop timed out after %d seconds, using Stop", gracefulShutdownTimeout)
+		grpcServer.Stop()
+	case <-isStopped:
+		log.Log.Infof("notify server GracefulStop complete")
+	}
 }

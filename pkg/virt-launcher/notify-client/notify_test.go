@@ -22,25 +22,27 @@ package eventsclient
 import (
 	"encoding/xml"
 	"fmt"
-	"io/ioutil"
 	"os"
-	"reflect"
 	"time"
 
 	"github.com/golang/mock/gomock"
-	"github.com/libvirt/libvirt-go"
-	. "github.com/onsi/ginkgo"
-	"github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"libvirt.org/go/libvirt"
 
+	api2 "kubevirt.io/client-go/api"
+
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 
-	v1 "kubevirt.io/kubevirt/pkg/api/v1"
+	v1 "kubevirt.io/api/core/v1"
+
 	"kubevirt.io/kubevirt/pkg/handler-launcher-com/notify/info"
 	"kubevirt.io/kubevirt/pkg/testutils"
 	notifyserver "kubevirt.io/kubevirt/pkg/virt-handler/notify-server"
+	"kubevirt.io/kubevirt/pkg/virt-launcher/metadata"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/api"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/cli"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/util"
@@ -56,6 +58,7 @@ var _ = Describe("Notify", func() {
 		var eventChan chan watch.Event
 		var deleteNotificationSent chan watch.Event
 		var client *Notifier
+		var metadataCache *metadata.Cache
 
 		var mockDomain *cli.MockVirDomain
 		var mockCon *cli.MockConnection
@@ -71,7 +74,7 @@ var _ = Describe("Notify", func() {
 			eventChan = make(chan watch.Event, 100)
 			deleteNotificationSent = make(chan watch.Event, 100)
 			stopped = false
-			shareDir, err = ioutil.TempDir("", "kubevirt-share")
+			shareDir, err = os.MkdirTemp("", "kubevirt-share")
 			Expect(err).ToNot(HaveOccurred())
 
 			go func() {
@@ -80,8 +83,9 @@ var _ = Describe("Notify", func() {
 
 			time.Sleep(1 * time.Second)
 
-			client, err = NewNotifier(shareDir)
-			Expect(err).ToNot(HaveOccurred())
+			client = NewNotifier(shareDir)
+
+			metadataCache = metadata.NewCache()
 		})
 
 		AfterEach(func() {
@@ -90,11 +94,10 @@ var _ = Describe("Notify", func() {
 			}
 			client.Close()
 			os.RemoveAll(shareDir)
-			ctrl.Finish()
 		})
 
 		Context("server", func() {
-			table.DescribeTable("should accept Domain notify events", func(state libvirt.DomainState, event libvirt.DomainEventType, kubevirtState api.LifeCycle, kubeEventType watch.EventType) {
+			DescribeTable("should accept Domain notify events", func(state libvirt.DomainState, event libvirt.DomainEventType, kubevirtState api.LifeCycle, kubeEventType watch.EventType) {
 				domain := api.NewMinimalDomain("test")
 				x, err := xml.Marshal(domain.Spec)
 				Expect(err).ToNot(HaveOccurred())
@@ -103,9 +106,8 @@ var _ = Describe("Notify", func() {
 				mockDomain.EXPECT().Free()
 				mockDomain.EXPECT().GetName().Return("test", nil).AnyTimes()
 				mockDomain.EXPECT().GetXMLDesc(gomock.Eq(libvirt.DomainXMLFlags(0))).Return(string(x), nil)
-				mockDomain.EXPECT().GetMetadata(libvirt.DOMAIN_METADATA_ELEMENT, "http://kubevirt.io", libvirt.DOMAIN_AFFECT_CONFIG).Return(`<kubevirt></kubevirt>`, nil)
 
-				eventCallback(mockCon, util.NewDomainFromName("test", "1234"), libvirtEvent{Event: &libvirt.DomainEventLifecycle{Event: event}}, client, deleteNotificationSent, nil)
+				eventCallback(mockCon, util.NewDomainFromName("test", "1234"), libvirtEvent{Event: &libvirt.DomainEventLifecycle{Event: event}}, client, deleteNotificationSent, nil, nil, nil, nil, metadataCache)
 
 				timedOut := false
 				timeout := time.After(2 * time.Second)
@@ -115,17 +117,17 @@ var _ = Describe("Notify", func() {
 				case event := <-eventChan:
 					newDomain, ok := event.Object.(*api.Domain)
 					newDomain.Spec.XMLName = xml.Name{}
-					Expect(ok).To(Equal(true), "should typecase domain")
-					Expect(reflect.DeepEqual(domain.Spec, newDomain.Spec)).To(Equal(true))
+					Expect(ok).To(BeTrue(), "should typecase domain")
+					Expect(equality.Semantic.DeepEqual(domain.Spec, newDomain.Spec)).To(BeTrue())
 					Expect(event.Type).To(Equal(kubeEventType))
 				}
-				Expect(timedOut).To(Equal(false), "should not time out")
+				Expect(timedOut).To(BeFalse(), "should not time out")
 			},
-				table.Entry("modified for crashed VMIs", libvirt.DOMAIN_CRASHED, libvirt.DOMAIN_EVENT_CRASHED, api.Crashed, watch.Modified),
-				table.Entry("modified for stopped VMIs", libvirt.DOMAIN_SHUTOFF, libvirt.DOMAIN_EVENT_SHUTDOWN, api.Shutoff, watch.Modified),
-				table.Entry("modified for stopped VMIs", libvirt.DOMAIN_SHUTOFF, libvirt.DOMAIN_EVENT_STOPPED, api.Shutoff, watch.Modified),
-				table.Entry("modified for running VMIs", libvirt.DOMAIN_RUNNING, libvirt.DOMAIN_EVENT_STARTED, api.Running, watch.Modified),
-				table.Entry("added for defined VMIs", libvirt.DOMAIN_SHUTOFF, libvirt.DOMAIN_EVENT_DEFINED, api.Shutoff, watch.Added),
+				Entry("modified for crashed VMIs", libvirt.DOMAIN_CRASHED, libvirt.DOMAIN_EVENT_CRASHED, api.Crashed, watch.Modified),
+				Entry("modified for stopped VMIs with shutoff reason", libvirt.DOMAIN_SHUTOFF, libvirt.DOMAIN_EVENT_SHUTDOWN, api.Shutoff, watch.Modified),
+				Entry("modified for stopped VMIs with stopped reason", libvirt.DOMAIN_SHUTOFF, libvirt.DOMAIN_EVENT_STOPPED, api.Shutoff, watch.Modified),
+				Entry("modified for running VMIs", libvirt.DOMAIN_RUNNING, libvirt.DOMAIN_EVENT_STARTED, api.Running, watch.Modified),
+				Entry("added for defined VMIs", libvirt.DOMAIN_SHUTOFF, libvirt.DOMAIN_EVENT_DEFINED, api.Shutoff, watch.Added),
 			)
 		})
 
@@ -136,7 +138,7 @@ var _ = Describe("Notify", func() {
 				mockDomain.EXPECT().GetState().Return(libvirt.DOMAIN_NOSTATE, -1, libvirt.Error{Code: libvirt.ERR_NO_DOMAIN})
 				mockDomain.EXPECT().GetName().Return("test", nil).AnyTimes()
 
-				eventCallback(mockCon, util.NewDomainFromName("test", "1234"), libvirtEvent{Event: &libvirt.DomainEventLifecycle{Event: libvirt.DOMAIN_EVENT_UNDEFINED}}, client, deleteNotificationSent, nil)
+				eventCallback(mockCon, util.NewDomainFromName("test", "1234"), libvirtEvent{Event: &libvirt.DomainEventLifecycle{Event: libvirt.DOMAIN_EVENT_UNDEFINED}}, client, deleteNotificationSent, nil, nil, nil, nil, metadataCache)
 
 				timedOut := false
 				timeout := time.After(2 * time.Second)
@@ -145,9 +147,11 @@ var _ = Describe("Notify", func() {
 					timedOut = true
 				case e := <-eventChan:
 					Expect(e.Object.(*api.Domain).Status.Status).To(Equal(api.NoState))
-					Expect(e.Type).To(Equal(watch.Deleted))
+					Expect(e.Object.(*api.Domain).ObjectMeta.DeletionTimestamp).ToNot(BeNil())
+					Expect(e.Type).To(Equal(watch.Modified))
+
 				}
-				Expect(timedOut).To(Equal(false))
+				Expect(timedOut).To(BeFalse())
 
 				select {
 				case <-timeout:
@@ -155,7 +159,7 @@ var _ = Describe("Notify", func() {
 				case <-deleteNotificationSent:
 					// virt-launcher waits in a final delete notification to be sent before exiting.
 				}
-				Expect(timedOut).To(Equal(false))
+				Expect(timedOut).To(BeFalse())
 			})
 
 		It("should update Interface status",
@@ -167,18 +171,14 @@ var _ = Describe("Notify", func() {
 				mockDomain.EXPECT().GetState().Return(libvirt.DOMAIN_RUNNING, -1, nil)
 				mockDomain.EXPECT().GetName().Return("test", nil).AnyTimes()
 				mockDomain.EXPECT().GetXMLDesc(gomock.Eq(libvirt.DomainXMLFlags(0))).Return(string(x), nil)
-				mockDomain.EXPECT().GetMetadata(libvirt.DOMAIN_METADATA_ELEMENT, "http://kubevirt.io", libvirt.DOMAIN_AFFECT_CONFIG).Return(`<kubevirt></kubevirt>`, nil)
 
 				interfaceStatus := []api.InterfaceStatus{
-					api.InterfaceStatus{
-						Name: "test", Ip: "1.1.1.1/24", Mac: "1", InterfaceName: "eth1",
-					},
-					api.InterfaceStatus{
-						Name: "test2",
+					{
+						Ip: "1.1.1.1/24", Mac: "1", InterfaceName: "eth1",
 					},
 				}
 
-				eventCallback(mockCon, util.NewDomainFromName("test", "1234"), libvirtEvent{}, client, deleteNotificationSent, &interfaceStatus)
+				eventCallback(mockCon, util.NewDomainFromName("test", "1234"), libvirtEvent{}, client, deleteNotificationSent, interfaceStatus, nil, nil, nil, metadataCache)
 
 				timedOut := false
 				timeout := time.After(2 * time.Second)
@@ -188,10 +188,70 @@ var _ = Describe("Notify", func() {
 				case event := <-eventChan:
 					newDomain, _ := event.Object.(*api.Domain)
 					newInterfaceStatuses := newDomain.Status.Interfaces
-					Expect(len(newInterfaceStatuses)).To(Equal(2))
-					Expect(reflect.DeepEqual(interfaceStatus, newInterfaceStatuses)).To(Equal(true))
+					Expect(newInterfaceStatuses).To(HaveLen(1))
+					Expect(equality.Semantic.DeepEqual(interfaceStatus, newInterfaceStatuses)).To(BeTrue())
 				}
-				Expect(timedOut).To(Equal(false))
+				Expect(timedOut).To(BeFalse())
+			})
+
+		It("should update Guest OS Info",
+			func() {
+				domain := api.NewMinimalDomain("test")
+				x, err := xml.Marshal(domain.Spec)
+				Expect(err).ToNot(HaveOccurred())
+				mockDomain.EXPECT().Free()
+				mockDomain.EXPECT().GetState().Return(libvirt.DOMAIN_RUNNING, -1, nil)
+				mockDomain.EXPECT().GetName().Return("test", nil).AnyTimes()
+				mockDomain.EXPECT().GetXMLDesc(gomock.Eq(libvirt.DomainXMLFlags(0))).Return(string(x), nil)
+
+				guestOsName := "TestGuestOS"
+				osInfoStatus := api.GuestOSInfo{
+					Name: guestOsName,
+				}
+
+				eventCallback(mockCon, util.NewDomainFromName("test", "1234"), libvirtEvent{}, client, deleteNotificationSent, nil, &osInfoStatus, nil, nil, metadataCache)
+
+				timedOut := false
+				timeout := time.After(2 * time.Second)
+				select {
+				case <-timeout:
+					timedOut = true
+				case event := <-eventChan:
+					newDomain, _ := event.Object.(*api.Domain)
+					newOSStatus := newDomain.Status.OSInfo
+					Expect(equality.Semantic.DeepEqual(osInfoStatus, newOSStatus)).To(BeTrue())
+				}
+				Expect(timedOut).To(BeFalse())
+			})
+
+		It("should update Guest FSFreeze status",
+			func() {
+				domain := api.NewMinimalDomain("test")
+				x, err := xml.Marshal(domain.Spec)
+				Expect(err).ToNot(HaveOccurred())
+				mockDomain.EXPECT().Free()
+				mockDomain.EXPECT().GetState().Return(libvirt.DOMAIN_RUNNING, -1, nil)
+				mockDomain.EXPECT().GetName().Return("test", nil).AnyTimes()
+				mockDomain.EXPECT().GetXMLDesc(gomock.Eq(libvirt.DomainXMLFlags(0))).Return(string(x), nil)
+
+				fsFrozenStatus := "frozen"
+				fsFreezeStatus := api.FSFreeze{
+					Status: fsFrozenStatus,
+				}
+
+				eventCallback(mockCon, util.NewDomainFromName("test", "1234"), libvirtEvent{}, client, deleteNotificationSent, nil, nil, nil, &fsFreezeStatus, metadataCache)
+
+				timedOut := false
+				timeout := time.After(2 * time.Second)
+				select {
+				case <-timeout:
+					timedOut = true
+				case event := <-eventChan:
+					newDomain, _ := event.Object.(*api.Domain)
+					newFSFreezeStatus := newDomain.Status.FSFreezeStatus
+					Expect(equality.Semantic.DeepEqual(fsFreezeStatus, newFSFreezeStatus)).To(BeTrue())
+				}
+				Expect(timedOut).To(BeFalse())
 			})
 	})
 
@@ -201,6 +261,7 @@ var _ = Describe("Notify", func() {
 		var stop chan struct{}
 		var stopped bool
 		var eventChan chan watch.Event
+		var deleteNotificationSent chan watch.Event
 		var client *Notifier
 		var recorder *record.FakeRecorder
 		var vmiStore cache.Store
@@ -208,11 +269,13 @@ var _ = Describe("Notify", func() {
 		BeforeEach(func() {
 			stop = make(chan struct{})
 			eventChan = make(chan watch.Event, 100)
+			deleteNotificationSent = make(chan watch.Event, 100)
 			stopped = false
-			shareDir, err = ioutil.TempDir("", "kubevirt-share")
+			shareDir, err = os.MkdirTemp("", "kubevirt-share")
 			Expect(err).ToNot(HaveOccurred())
 
 			recorder = record.NewFakeRecorder(10)
+			recorder.IncludeObject = true
 			vmiInformer, _ := testutils.NewFakeInformerFor(&v1.VirtualMachineInstance{})
 			vmiStore = vmiInformer.GetStore()
 
@@ -222,8 +285,7 @@ var _ = Describe("Notify", func() {
 
 			time.Sleep(1 * time.Second)
 
-			client, err = NewNotifier(shareDir)
-			Expect(err).ToNot(HaveOccurred())
+			client = NewNotifier(shareDir)
 		})
 
 		AfterEach(func() {
@@ -234,9 +296,9 @@ var _ = Describe("Notify", func() {
 			os.RemoveAll(shareDir)
 		})
 
-		It("Should send a k8s event", func(done Done) {
+		It("Should send a k8s event", func() {
 
-			vmi := v1.NewMinimalVMI("fake-vmi")
+			vmi := api2.NewMinimalVMI("fake-vmi")
 			vmi.UID = "4321"
 			vmiStore.Add(vmi)
 
@@ -248,9 +310,42 @@ var _ = Describe("Notify", func() {
 			Expect(err).ToNot(HaveOccurred())
 
 			event := <-recorder.Events
-			Expect(event).To(Equal(fmt.Sprintf("%s %s %s", eventType, eventReason, eventMessage)))
-			close(done)
-		}, 5)
+			Expect(event).To(Equal(fmt.Sprintf("%s %s %s involvedObject{kind=VirtualMachineInstance,apiVersion=kubevirt.io/v1}", eventType, eventReason, eventMessage)))
+		})
+
+		It("Should generate a k8s event on IO errors", func() {
+			faultDisk := []libvirt.DomainDiskError{
+				{
+					Disk:  "vda",
+					Error: libvirt.DOMAIN_DISK_ERROR_NO_SPACE,
+				},
+			}
+			domain := api.NewMinimalDomain("test")
+			domain.Status.Reason = api.ReasonPausedIOError
+			x, err := xml.Marshal(domain.Spec)
+			Expect(err).ToNot(HaveOccurred())
+
+			ctrl := gomock.NewController(GinkgoT())
+			mockCon := cli.NewMockConnection(ctrl)
+			mockDomain := cli.NewMockVirDomain(ctrl)
+			mockCon.EXPECT().LookupDomainByName(gomock.Any()).Return(mockDomain, nil).AnyTimes()
+			mockDomain.EXPECT().GetState().Return(libvirt.DOMAIN_PAUSED, int(libvirt.DOMAIN_PAUSED_IOERROR), nil)
+			mockDomain.EXPECT().Free()
+			mockDomain.EXPECT().GetXMLDesc(gomock.Eq(libvirt.DomainXMLFlags(0))).Return(string(x), nil)
+			mockDomain.EXPECT().GetDiskErrors(uint32(0)).Return(faultDisk, nil)
+
+			vmi := api2.NewMinimalVMI("fake-vmi")
+			vmi.UID = "4321"
+			vmiStore.Add(vmi)
+			eventType := "Warning"
+			eventReason := "IOerror"
+			eventMessage := "VM Paused due to not enough space on volume: "
+			metadataCache := metadata.NewCache()
+			eventCallback(mockCon, domain, libvirtEvent{}, client, deleteNotificationSent, nil, nil, vmi, nil, metadataCache)
+			event := <-recorder.Events
+			Expect(event).To(Equal(fmt.Sprintf("%s %s %s involvedObject{kind=VirtualMachineInstance,apiVersion=kubevirt.io/v1}", eventType, eventReason, eventMessage)))
+		})
+
 	})
 
 	Describe("Version mismatch", func() {
@@ -264,10 +359,6 @@ var _ = Describe("Notify", func() {
 			infoClient = info.NewMockNotifyInfoClient(ctrl)
 		})
 
-		AfterEach(func() {
-			ctrl.Finish()
-		})
-
 		It("Should report error when server version mismatches", func() {
 
 			fakeResponse := info.NotifyInfoResponse{
@@ -276,12 +367,11 @@ var _ = Describe("Notify", func() {
 			infoClient.EXPECT().Info(gomock.Any(), gomock.Any()).Return(&fakeResponse, nil)
 
 			By("Initializing the notifier")
-			_, err = NewNotifierWithInfoClient(infoClient, nil)
+			_, err = negotiateVersion(infoClient)
 
 			Expect(err).To(HaveOccurred(), "Should have returned error about incompatible versions")
 			Expect(err.Error()).To(ContainSubstring("no compatible version found"), "Expected error message to contain 'no compatible version found'")
 
 		})
-
 	})
 })

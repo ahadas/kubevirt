@@ -20,14 +20,17 @@
 package config
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
 
-	. "github.com/onsi/ginkgo"
+	"kubevirt.io/kubevirt/pkg/libvmi"
+
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	v1 "kubevirt.io/kubevirt/pkg/api/v1"
+	"kubevirt.io/client-go/api"
+
+	v1 "kubevirt.io/api/core/v1"
 )
 
 var _ = Describe("ServiceAccount", func() {
@@ -35,13 +38,13 @@ var _ = Describe("ServiceAccount", func() {
 	BeforeEach(func() {
 		var err error
 
-		ServiceAccountSourceDir, err = ioutil.TempDir("", "serviceaccount")
+		ServiceAccountSourceDir, err = os.MkdirTemp("", "serviceaccount")
 		Expect(err).NotTo(HaveOccurred())
 		os.MkdirAll(ServiceAccountSourceDir, 0755)
 		os.OpenFile(filepath.Join(ServiceAccountSourceDir, "token"), os.O_RDONLY|os.O_CREATE, 0666)
 		os.OpenFile(filepath.Join(ServiceAccountSourceDir, "namespace"), os.O_RDONLY|os.O_CREATE, 0666)
 
-		ServiceAccountDiskDir, err = ioutil.TempDir("", "serviceaccount-disk")
+		ServiceAccountDiskDir, err = os.MkdirTemp("", "serviceaccount-disk")
 		Expect(err).NotTo(HaveOccurred())
 	})
 
@@ -51,7 +54,18 @@ var _ = Describe("ServiceAccount", func() {
 	})
 
 	It("Should create a new service account iso disk", func() {
-		vmi := v1.NewMinimalVMI("fake-vmi")
+		vmi := libvmi.New(
+			libvmi.WithServiceAccountDisk("testaccount"),
+		)
+
+		err := CreateServiceAccountDisk(vmi, false)
+		Expect(err).NotTo(HaveOccurred())
+		_, err = os.Stat(filepath.Join(ServiceAccountDiskDir, ServiceAccountDiskName))
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("Should create a new service account iso disk without a Disk device", func() {
+		vmi := api.NewMinimalVMI("fake-vmi")
 		vmi.Spec.Volumes = append(vmi.Spec.Volumes, v1.Volume{
 			Name: "serviceaccount-volume",
 			VolumeSource: v1.VolumeSource{
@@ -61,10 +75,9 @@ var _ = Describe("ServiceAccount", func() {
 			},
 		})
 
-		err := CreateServiceAccountDisk(vmi)
+		err := CreateServiceAccountDisk(vmi, false)
 		Expect(err).NotTo(HaveOccurred())
-		_, err = os.Stat(filepath.Join(ServiceAccountDiskDir, ServiceAccountDiskName))
-		Expect(err).NotTo(HaveOccurred())
+		files, _ := os.ReadDir(ServiceAccountDiskDir)
+		Expect(files).To(BeEmpty())
 	})
-
 })

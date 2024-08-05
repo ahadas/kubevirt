@@ -3,14 +3,9 @@ package mutators
 import (
 	"testing"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
-
-	"kubevirt.io/kubevirt/pkg/log"
+	"kubevirt.io/client-go/testutils"
 )
 
 func TestMutatingWebhook(t *testing.T) {
-	log.Log.SetIOWriter(GinkgoWriter)
-	RegisterFailHandler(Fail)
-	RunSpecs(t, "Mutators Suite")
+	testutils.KubeVirtTestSuiteSetup(t)
 }

@@ -20,78 +20,95 @@
 package validating_webhook
 
 import (
-	"encoding/json"
 	"net/http"
 
-	"k8s.io/api/admission/v1beta1"
-	"k8s.io/apimachinery/pkg/runtime"
+	"kubevirt.io/client-go/kubecli"
 
-	"kubevirt.io/kubevirt/pkg/log"
+	validating_webhooks "kubevirt.io/kubevirt/pkg/util/webhooks/validating-webhooks"
 	"kubevirt.io/kubevirt/pkg/virt-api/webhooks"
 	"kubevirt.io/kubevirt/pkg/virt-api/webhooks/validating-webhook/admitters"
 	virtconfig "kubevirt.io/kubevirt/pkg/virt-config"
 )
 
-type admitter interface {
-	Admit(*v1beta1.AdmissionReview) *v1beta1.AdmissionResponse
-}
-
-func serve(resp http.ResponseWriter, req *http.Request, a admitter) {
-	response := v1beta1.AdmissionReview{}
-	review, err := webhooks.GetAdmissionReview(req)
-
-	if err != nil {
-		resp.WriteHeader(http.StatusBadRequest)
-		return
-	}
-
-	reviewResponse := a.Admit(review)
-	if reviewResponse != nil {
-		response.Response = reviewResponse
-		response.Response.UID = review.Request.UID
-	}
-	// reset the Object and OldObject, they are not needed in a response.
-	review.Request.Object = runtime.RawExtension{}
-	review.Request.OldObject = runtime.RawExtension{}
-
-	responseBytes, err := json.Marshal(response)
-	if err != nil {
-		log.Log.Reason(err).Errorf("failed json encode webhook response")
-		resp.WriteHeader(http.StatusBadRequest)
-		return
-	}
-	if _, err := resp.Write(responseBytes); err != nil {
-		log.Log.Reason(err).Errorf("failed to write webhook response")
-		resp.WriteHeader(http.StatusBadRequest)
-		return
-	}
-	resp.WriteHeader(http.StatusOK)
-}
-
 func ServeVMICreate(resp http.ResponseWriter, req *http.Request, clusterConfig *virtconfig.ClusterConfig) {
-	serve(resp, req, &admitters.VMICreateAdmitter{ClusterConfig: clusterConfig})
+	validating_webhooks.Serve(resp, req, &admitters.VMICreateAdmitter{ClusterConfig: clusterConfig})
 }
 
-func ServeVMIUpdate(resp http.ResponseWriter, req *http.Request) {
-	serve(resp, req, &admitters.VMIUpdateAdmitter{})
+func ServeVMIUpdate(resp http.ResponseWriter, req *http.Request, clusterConfig *virtconfig.ClusterConfig) {
+	validating_webhooks.Serve(resp, req, &admitters.VMIUpdateAdmitter{ClusterConfig: clusterConfig})
 }
 
-func ServeVMs(resp http.ResponseWriter, req *http.Request, clusterConfig *virtconfig.ClusterConfig) {
-	serve(resp, req, &admitters.VMsAdmitter{ClusterConfig: clusterConfig})
+func ServeVMs(resp http.ResponseWriter, req *http.Request, clusterConfig *virtconfig.ClusterConfig, virtCli kubecli.KubevirtClient, informers *webhooks.Informers) {
+
+	validating_webhooks.Serve(resp, req, admitters.NewVMsAdmitter(clusterConfig, virtCli, informers))
 }
 
 func ServeVMIRS(resp http.ResponseWriter, req *http.Request, clusterConfig *virtconfig.ClusterConfig) {
-	serve(resp, req, &admitters.VMIRSAdmitter{ClusterConfig: clusterConfig})
+	validating_webhooks.Serve(resp, req, &admitters.VMIRSAdmitter{ClusterConfig: clusterConfig})
+}
+
+func ServeVMPool(resp http.ResponseWriter, req *http.Request, clusterConfig *virtconfig.ClusterConfig) {
+	validating_webhooks.Serve(resp, req, &admitters.VMPoolAdmitter{ClusterConfig: clusterConfig})
 }
 
 func ServeVMIPreset(resp http.ResponseWriter, req *http.Request) {
-	serve(resp, req, &admitters.VMIPresetAdmitter{})
+	validating_webhooks.Serve(resp, req, &admitters.VMIPresetAdmitter{})
 }
 
-func ServeMigrationCreate(resp http.ResponseWriter, req *http.Request, clusterConfig *virtconfig.ClusterConfig) {
-	serve(resp, req, &admitters.MigrationCreateAdmitter{ClusterConfig: clusterConfig})
+func ServeMigrationCreate(resp http.ResponseWriter, req *http.Request, clusterConfig *virtconfig.ClusterConfig, virtCli kubecli.KubevirtClient) {
+	validating_webhooks.Serve(resp, req, &admitters.MigrationCreateAdmitter{ClusterConfig: clusterConfig, VirtClient: virtCli})
 }
 
 func ServeMigrationUpdate(resp http.ResponseWriter, req *http.Request) {
-	serve(resp, req, &admitters.MigrationUpdateAdmitter{})
+	validating_webhooks.Serve(resp, req, &admitters.MigrationUpdateAdmitter{})
+}
+
+func ServeVMSnapshots(resp http.ResponseWriter, req *http.Request, clusterConfig *virtconfig.ClusterConfig, virtCli kubecli.KubevirtClient) {
+	validating_webhooks.Serve(resp, req, admitters.NewVMSnapshotAdmitter(clusterConfig, virtCli))
+}
+
+func ServeVMRestores(resp http.ResponseWriter, req *http.Request, clusterConfig *virtconfig.ClusterConfig, virtCli kubecli.KubevirtClient, informers *webhooks.Informers) {
+	validating_webhooks.Serve(resp, req, admitters.NewVMRestoreAdmitter(clusterConfig, virtCli, informers.VMRestoreInformer))
+}
+
+func ServeVMExports(resp http.ResponseWriter, req *http.Request, clusterConfig *virtconfig.ClusterConfig) {
+	validating_webhooks.Serve(resp, req, admitters.NewVMExportAdmitter(clusterConfig))
+}
+
+func ServeVmInstancetypes(resp http.ResponseWriter, req *http.Request, clusterConfig *virtconfig.ClusterConfig, virtCli kubecli.KubevirtClient) {
+	validating_webhooks.Serve(resp, req, &admitters.InstancetypeAdmitter{})
+}
+
+func ServeVmClusterInstancetypes(resp http.ResponseWriter, req *http.Request, clusterConfig *virtconfig.ClusterConfig, virtCli kubecli.KubevirtClient) {
+	validating_webhooks.Serve(resp, req, &admitters.ClusterInstancetypeAdmitter{})
+}
+
+func ServeVmPreferences(resp http.ResponseWriter, req *http.Request, clusterConfig *virtconfig.ClusterConfig, virtCli kubecli.KubevirtClient) {
+	validating_webhooks.Serve(resp, req, &admitters.PreferenceAdmitter{})
+}
+
+func ServeVmClusterPreferences(resp http.ResponseWriter, req *http.Request, clusterConfig *virtconfig.ClusterConfig, virtCli kubecli.KubevirtClient) {
+	validating_webhooks.Serve(resp, req, &admitters.ClusterPreferenceAdmitter{})
+}
+
+func ServeStatusValidation(resp http.ResponseWriter,
+	req *http.Request,
+	clusterConfig *virtconfig.ClusterConfig,
+	virtCli kubecli.KubevirtClient,
+	informers *webhooks.Informers) {
+	validating_webhooks.Serve(resp, req, &admitters.StatusAdmitter{
+		VmsAdmitter: admitters.NewVMsAdmitter(clusterConfig, virtCli, informers),
+	})
+}
+
+func ServePodEvictionInterceptor(resp http.ResponseWriter, req *http.Request, clusterConfig *virtconfig.ClusterConfig, virtCli kubecli.KubevirtClient) {
+	validating_webhooks.Serve(resp, req, admitters.NewPodEvictionAdmitter(clusterConfig, virtCli, virtCli.GeneratedKubeVirtClient()))
+}
+
+func ServeMigrationPolicies(resp http.ResponseWriter, req *http.Request, clusterConfig *virtconfig.ClusterConfig, virtCli kubecli.KubevirtClient) {
+	validating_webhooks.Serve(resp, req, admitters.NewMigrationPolicyAdmitter())
+}
+
+func ServeVirtualMachineClones(resp http.ResponseWriter, req *http.Request, clusterConfig *virtconfig.ClusterConfig, virtCli kubecli.KubevirtClient) {
+	validating_webhooks.Serve(resp, req, admitters.NewVMCloneAdmitter(clusterConfig, virtCli))
 }

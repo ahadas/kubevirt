@@ -20,31 +20,22 @@
 package webhooks
 
 import (
-	"encoding/json"
 	"fmt"
-	"io/ioutil"
-	"net/http"
-	"sync"
+	"runtime"
 
-	"github.com/golang/glog"
-	"k8s.io/api/admission/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/cache"
 
-	v1 "kubevirt.io/kubevirt/pkg/api/v1"
-	"kubevirt.io/kubevirt/pkg/controller"
-	"kubevirt.io/kubevirt/pkg/kubecli"
-	"kubevirt.io/kubevirt/pkg/log"
-	"kubevirt.io/kubevirt/pkg/util"
-	"kubevirt.io/kubevirt/pkg/util/openapi"
-	"kubevirt.io/kubevirt/pkg/virt-api/rest"
+	poolv1 "kubevirt.io/api/pool/v1alpha1"
+	"kubevirt.io/client-go/log"
+
+	"kubevirt.io/kubevirt/pkg/virt-operator/resource/generate/components"
+
+	v1 "kubevirt.io/api/core/v1"
+	clientutil "kubevirt.io/client-go/util"
 )
 
-var webhookInformers *Informers
-var once sync.Once
-
-var Validator = openapi.CreateOpenAPIValidator(rest.ComposeAPIDefinitions())
+var Arch = runtime.GOARCH
 
 var VirtualMachineInstanceGroupVersionResource = metav1.GroupVersionResource{
 	Group:    v1.VirtualMachineInstanceGroupVersionKind.Group,
@@ -70,6 +61,12 @@ var VirtualMachineInstanceReplicaSetGroupVersionResource = metav1.GroupVersionRe
 	Resource: "virtualmachineinstancereplicasets",
 }
 
+var VirtualMachinePoolGroupVersionResource = metav1.GroupVersionResource{
+	Group:    poolv1.SchemeGroupVersion.Group,
+	Version:  poolv1.SchemeGroupVersion.Version,
+	Resource: "virtualmachinepools",
+}
+
 var MigrationGroupVersionResource = metav1.GroupVersionResource{
 	Group:    v1.VirtualMachineInstanceMigrationGroupVersionKind.Group,
 	Version:  v1.VirtualMachineInstanceMigrationGroupVersionKind.Version,
@@ -77,119 +74,42 @@ var MigrationGroupVersionResource = metav1.GroupVersionResource{
 }
 
 type Informers struct {
-	VMIPresetInformer       cache.SharedIndexInformer
-	NamespaceLimitsInformer cache.SharedIndexInformer
-	VMIInformer             cache.SharedIndexInformer
+	VMIPresetInformer  cache.SharedIndexInformer
+	VMRestoreInformer  cache.SharedIndexInformer
+	DataSourceInformer cache.SharedIndexInformer
+	NamespaceInformer  cache.SharedIndexInformer
 }
 
-func GetInformers() *Informers {
-	once.Do(func() {
-		webhookInformers = newInformers()
-	})
-	return webhookInformers
+func IsComponentServiceAccount(serviceAccount, namespace, component string) bool {
+	return serviceAccount == fmt.Sprintf("system:serviceaccount:%s:%s", namespace, component)
 }
 
-// SetInformers created for unittest usage only
-func SetInformers(informers *Informers) {
-	once.Do(func() {
-		webhookInformers = informers
-	})
-}
+func GetNamespace() string {
+	ns, err := clientutil.GetNamespace()
+	logger := log.DefaultLogger()
 
-func newInformers() *Informers {
-	kubeClient, err := kubecli.GetKubevirtClient()
 	if err != nil {
-		panic(err)
+		logger.Info("Failed to get namespace. Fallback to default: 'kubevirt'")
+		ns = "kubevirt"
 	}
-	namespace, err := util.GetNamespace()
-	if err != nil {
-		glog.Fatalf("Error searching for namespace: %v", err)
-	}
-	kubeInformerFactory := controller.NewKubeInformerFactory(kubeClient.RestClient(), kubeClient, namespace)
-	return &Informers{
-		VMIInformer:             kubeInformerFactory.VMI(),
-		VMIPresetInformer:       kubeInformerFactory.VirtualMachinePreset(),
-		NamespaceLimitsInformer: kubeInformerFactory.LimitRanges(),
-	}
+	return ns
 }
 
-// GetAdmissionReview
-func GetAdmissionReview(r *http.Request) (*v1beta1.AdmissionReview, error) {
-	var body []byte
-	if r.Body != nil {
-		if data, err := ioutil.ReadAll(r.Body); err == nil {
-			body = data
-		}
-	}
+func IsKubeVirtServiceAccount(serviceAccount string) bool {
+	ns := GetNamespace()
 
-	// verify the content type is accurate
-	contentType := r.Header.Get("Content-Type")
-	if contentType != "application/json" {
-		return nil, fmt.Errorf("contentType=%s, expect application/json", contentType)
-	}
-
-	ar := &v1beta1.AdmissionReview{}
-	err := json.Unmarshal(body, ar)
-	return ar, err
+	return IsComponentServiceAccount(serviceAccount, ns, components.ApiServiceAccountName) ||
+		IsComponentServiceAccount(serviceAccount, ns, components.HandlerServiceAccountName) ||
+		IsComponentServiceAccount(serviceAccount, ns, components.ControllerServiceAccountName)
 }
 
-// ToAdmissionResponseError
-func ToAdmissionResponseError(err error) *v1beta1.AdmissionResponse {
-	log.Log.Reason(err).Error("admission generic error")
-
-	return &v1beta1.AdmissionResponse{
-		Result: &metav1.Status{
-			Message: err.Error(),
-			Code:    http.StatusBadRequest,
-		},
-	}
+func IsARM64(vmiSpec *v1.VirtualMachineInstanceSpec) bool {
+	return vmiSpec.Architecture == "arm64"
 }
 
-func ToAdmissionResponse(causes []metav1.StatusCause) *v1beta1.AdmissionResponse {
-	log.Log.Infof("rejected vmi admission")
-
-	globalMessage := ""
-	for _, cause := range causes {
-		if globalMessage == "" {
-			globalMessage = cause.Message
-		} else {
-			globalMessage = fmt.Sprintf("%s, %s", globalMessage, cause.Message)
-		}
-	}
-
-	return &v1beta1.AdmissionResponse{
-		Result: &metav1.Status{
-			Message: globalMessage,
-			Reason:  metav1.StatusReasonInvalid,
-			Code:    http.StatusUnprocessableEntity,
-			Details: &metav1.StatusDetails{
-				Causes: causes,
-			},
-		},
-	}
+func IsPPC64(vmiSpec *v1.VirtualMachineInstanceSpec) bool {
+	return vmiSpec.Architecture == "ppc64le"
 }
-
-func ValidationErrorsToAdmissionResponse(errs []error) *v1beta1.AdmissionResponse {
-	var causes []metav1.StatusCause
-	for _, e := range errs {
-		causes = append(causes,
-			metav1.StatusCause{
-				Message: e.Error(),
-			},
-		)
-	}
-	return ToAdmissionResponse(causes)
-}
-
-func ValidateSchema(gvk schema.GroupVersionKind, data []byte) *v1beta1.AdmissionResponse {
-	in := map[string]interface{}{}
-	err := json.Unmarshal(data, &in)
-	if err != nil {
-		return ToAdmissionResponseError(err)
-	}
-	errs := Validator.Validate(gvk, in)
-	if len(errs) > 0 {
-		return ValidationErrorsToAdmissionResponse(errs)
-	}
-	return nil
+func IsS390X(vmiSpec *v1.VirtualMachineInstanceSpec) bool {
+	return vmiSpec.Architecture == "s390x"
 }

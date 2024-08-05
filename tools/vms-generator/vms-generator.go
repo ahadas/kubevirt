@@ -25,16 +25,22 @@ import (
 	"os"
 	"path/filepath"
 
+	"kubevirt.io/api/migrations/v1alpha1"
+
 	"kubevirt.io/kubevirt/tools/util"
 
-	k8sv1 "k8s.io/api/core/v1"
+	admissionv1 "k8s.io/api/admission/v1"
+	authenticationv1 "k8s.io/api/authentication/v1"
+	schedulingv1 "k8s.io/api/scheduling/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sfield "k8s.io/apimachinery/pkg/util/validation/field"
 
-	v1 "kubevirt.io/kubevirt/pkg/api/v1"
+	v1 "kubevirt.io/api/core/v1"
+	instancetypev1beta1 "kubevirt.io/api/instancetype/v1beta1"
+	poolv1 "kubevirt.io/api/pool/v1alpha1"
+
 	"kubevirt.io/kubevirt/pkg/testutils"
 	validating_webhook "kubevirt.io/kubevirt/pkg/virt-api/webhooks/validating-webhook/admitters"
-	virtconfig "kubevirt.io/kubevirt/pkg/virt-config"
 	"kubevirt.io/kubevirt/tools/vms-generator/utils"
 )
 
@@ -43,44 +49,91 @@ func main() {
 	flag.StringVar(&utils.DockerTag, "container-tag", utils.DockerTag, "")
 	genDir := flag.String("generated-vms-dir", "", "")
 	flag.Parse()
+	permit := true
 
-	config, _ := testutils.NewFakeClusterConfig(&k8sv1.ConfigMap{
-		Data: map[string]string{
-			// Required to validate DataVolume usage
-			virtconfig.FeatureGatesKey: "DataVolumes,LiveMigration,SRIOV",
+	config, _, _ := testutils.NewFakeClusterConfigUsingKVConfig(&v1.KubeVirtConfiguration{
+		DeveloperConfiguration: &v1.DeveloperConfiguration{
+			FeatureGates: []string{"DataVolumes", "LiveMigration", "SRIOV", "GPU", "HostDisk", "Macvtap", "HostDevices", "Sidecar"},
+		},
+		NetworkConfiguration: &v1.NetworkConfiguration{
+			DeprecatedPermitSlirpInterface:    &permit,
+			PermitBridgeInterfaceOnPodNetwork: &permit,
+		},
+		PermittedHostDevices: &v1.PermittedHostDevices{
+			PciHostDevices: []v1.PciHostDevice{
+				{
+					PCIVendorSelector:        "10DE:1EB8",
+					ResourceName:             "nvidia.com/GP102GL_Tesla_P40",
+					ExternalResourceProvider: true,
+				},
+			},
 		},
 	})
 
+	var virtualMachineInstancetypes = map[string]*instancetypev1beta1.VirtualMachineInstancetype{
+		utils.VirtualMachineInstancetypeComputeSmall: utils.GetVirtualMachineInstancetypeComputeSmall(),
+		utils.VirtualMachineInstancetypeComputeLarge: utils.GetVirtualMachineInstancetypeComputeLarge(),
+	}
+
+	var virtualMachineClusterInstancetypes = map[string]*instancetypev1beta1.VirtualMachineClusterInstancetype{
+		utils.VirtualMachineClusterInstancetypeComputeSmall: utils.GetVirtualMachineClusterInstancetypeComputeSmall(),
+	}
+
+	var vmps = map[string]*instancetypev1beta1.VirtualMachinePreference{
+		utils.VirtualMachinePreferenceVirtio:  utils.GetVirtualMachinePreferenceVirtio(),
+		utils.VirtualMachinePreferenceWindows: utils.GetVirtualMachinePreferenceWindows(),
+	}
+
+	var priorityClasses = map[string]*schedulingv1.PriorityClass{
+		utils.Preemtible:    utils.GetPreemtible(),
+		utils.NonPreemtible: utils.GetNonPreemtible(),
+	}
+
 	var vms = map[string]*v1.VirtualMachine{
-		utils.VmCirros:           utils.GetVMCirros(),
-		utils.VmAlpineMultiPvc:   utils.GetVMMultiPvc(),
-		utils.VmAlpineDataVolume: utils.GetVMDataVolume(),
+		utils.VmCirros:                                            utils.GetVMCirros(),
+		utils.VmAlpineMultiPvc:                                    utils.GetVMMultiPvc(),
+		utils.VmAlpineDataVolume:                                  utils.GetVMDataVolume(),
+		utils.VMPriorityClass:                                     utils.GetVMPriorityClass(),
+		utils.VmCirrosSata:                                        utils.GetVMCirrosSata(),
+		utils.VmCirrosWithHookSidecarConfigMap:                    utils.GetVMCirrosWithHookSidecarConfigMap(),
+		utils.VmCirrosInstancetypeComputeSmall:                    utils.GetVmCirrosInstancetypeComputeSmall(),
+		utils.VmCirrosClusterInstancetypeComputeSmall:             utils.GetVmCirrosClusterInstancetypeComputeSmall(),
+		utils.VmCirrosInstancetypeComputeLarge:                    utils.GetVmCirrosInstancetypeComputeLarge(),
+		utils.VmCirrosInstancetypeComputeLargePreferncesVirtio:    utils.GetVmCirrosInstancetypeComputeLargePreferencesVirtio(),
+		utils.VmWindowsInstancetypeComputeLargePreferencesWindows: utils.GetVmWindowsInstancetypeComputeLargePreferencesWindows(),
+		utils.VmCirrosInstancetypeComputeLargePreferencesWindows:  utils.GetVmCirrosInstancetypeComputeLargePreferencesWindows(),
 	}
 
 	var vmis = map[string]*v1.VirtualMachineInstance{
-		utils.VmiEphemeral:         utils.GetVMIEphemeral(),
-		utils.VmiMigratable:        utils.GetVMIMigratable(),
-		utils.VmiFlavorSmall:       utils.GetVMIFlavorSmall(),
-		utils.VmiSata:              utils.GetVMISata(),
-		utils.VmiFedora:            utils.GetVMIEphemeralFedora(),
-		utils.VmiAlpineEFI:         utils.GetVMIAlpineEFI(),
-		utils.VmiNoCloud:           utils.GetVMINoCloud(),
-		utils.VmiPVC:               utils.GetVMIPvc(),
-		utils.VmiBlockPVC:          utils.GetVMIBlockPvc(),
-		utils.VmiWindows:           utils.GetVMIWindows(),
-		utils.VmiSlirp:             utils.GetVMISlirp(),
-		utils.VmiSRIOV:             utils.GetVMISRIOV(),
-		utils.VmiWithHookSidecar:   utils.GetVMIWithHookSidecar(),
-		utils.VmiMultusPtp:         utils.GetVMIMultusPtp(),
-		utils.VmiMultusMultipleNet: utils.GetVMIMultusMultipleNet(),
-		utils.VmiGeniePtp:          utils.GetVMIGeniePtp(),
-		utils.VmiGenieMultipleNet:  utils.GetVMIGenieMultipleNet(),
-		utils.VmiMasquerade:        utils.GetVMIMasquerade(),
-		utils.VmiHostDisk:          utils.GetVMIHostDisk(),
+		utils.VmiEphemeral:                utils.GetVMIEphemeral(),
+		utils.VmiMigratable:               utils.GetVMIMigratable(),
+		utils.VmiSata:                     utils.GetVMISata(),
+		utils.VmiFedora:                   utils.GetVMIEphemeralFedora(),
+		utils.VmiFedoraIsolated:           utils.GetVMIEphemeralFedoraIsolated(),
+		utils.VmiSecureBoot:               utils.GetVMISecureBoot(),
+		utils.VmiAlpineEFI:                utils.GetVMIAlpineEFI(),
+		utils.VmiNoCloud:                  utils.GetVMINoCloud(),
+		utils.VmiPVC:                      utils.GetVMIPvc(),
+		utils.VmiWindows:                  utils.GetVMIWindows(),
+		utils.VmiSRIOV:                    utils.GetVMISRIOV(),
+		utils.VmiWithHookSidecar:          utils.GetVMIWithHookSidecar(),
+		utils.VmiWithHookSidecarConfigMap: utils.GetVmiWithHookSidecarConfigMap(),
+		utils.VmiMultusPtp:                utils.GetVMIMultusPtp(),
+		utils.VmiMultusMultipleNet:        utils.GetVMIMultusMultipleNet(),
+		utils.VmiMasquerade:               utils.GetVMIMasquerade(),
+		utils.VmiHostDisk:                 utils.GetVMIHostDisk(),
+		utils.VmiGPU:                      utils.GetVMIGPU(),
+		utils.VmiKernelBoot:               utils.GetVMIKernelBoot(),
+		utils.VmiARM:                      utils.GetVMIARM(),
+		utils.VmiUSB:                      utils.GetVMIUSB(),
 	}
 
 	var vmireplicasets = map[string]*v1.VirtualMachineInstanceReplicaSet{
 		utils.VmiReplicaSetCirros: utils.GetVMIReplicaSetCirros(),
+	}
+
+	var vmpools = map[string]*poolv1.VirtualMachinePool{
+		utils.VmPoolCirros: utils.GetVMPoolCirros(),
 	}
 
 	var vmipresets = map[string]*v1.VirtualMachineInstancePreset{
@@ -95,6 +148,10 @@ func main() {
 		utils.VmTemplateFedora:  utils.GetTemplateFedora(),
 		utils.VmTemplateRHEL7:   utils.GetTemplateRHEL7(),
 		utils.VmTemplateWindows: utils.GetTemplateWindows(),
+	}
+
+	var migrationPolicies = map[string]*v1alpha1.MigrationPolicy{
+		utils.MigrationPolicyName: utils.GetMigrationPolicy(),
 	}
 
 	handleError := func(err error) {
@@ -132,7 +189,7 @@ func main() {
 
 	// Having no generics is lots of fun
 	for name, obj := range vms {
-		causes := validating_webhook.ValidateVirtualMachineSpec(k8sfield.NewPath("spec"), &obj.Spec, config)
+		causes := validating_webhook.ValidateVirtualMachineSpec(k8sfield.NewPath("spec"), &obj.Spec, config, "user-account")
 		handleCauses(causes, name, "vm")
 		handleError(dumpObject(name, *obj))
 	}
@@ -143,9 +200,36 @@ func main() {
 		handleError(dumpObject(name, *obj))
 	}
 
+	for name, obj := range virtualMachineInstancetypes {
+		handleError(dumpObject(name, *obj))
+	}
+
+	for name, obj := range virtualMachineClusterInstancetypes {
+		handleError(dumpObject(name, *obj))
+	}
+
+	for name, obj := range vmps {
+		handleError(dumpObject(name, *obj))
+	}
+
 	for name, obj := range vmireplicasets {
 		causes := validating_webhook.ValidateVMIRSSpec(k8sfield.NewPath("spec"), &obj.Spec, config)
 		handleCauses(causes, name, "vmi replica set")
+		handleError(dumpObject(name, *obj))
+	}
+
+	for name, obj := range vmpools {
+		ar := &admissionv1.AdmissionReview{
+
+			Request: &admissionv1.AdmissionRequest{
+				UserInfo: authenticationv1.UserInfo{
+					Username: "user-account",
+				},
+				Operation: admissionv1.Create,
+			},
+		}
+		causes := validating_webhook.ValidateVMPoolSpec(ar, k8sfield.NewPath("spec"), obj, config)
+		handleCauses(causes, name, "vm pool")
 		handleError(dumpObject(name, *obj))
 	}
 
@@ -163,6 +247,14 @@ func main() {
 
 	// TODO:(ihar) how to validate templates?
 	for name, obj := range templates {
+		handleError(dumpObject(name, *obj))
+	}
+
+	for name, obj := range priorityClasses {
+		handleError(dumpObject(name, *obj))
+	}
+
+	for name, obj := range migrationPolicies {
 		handleError(dumpObject(name, *obj))
 	}
 }

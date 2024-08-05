@@ -7,7 +7,7 @@ go_library(
         "deployment.go",
         "ingress.go",
         "interface.go",
-        "podsecuritypolicy.go",
+        "networkpolicy.go",
         "replicaset.go",
     ],
     importmap = "kubevirt.io/kubevirt/vendor/k8s.io/client-go/informers/extensions/v1beta1",

@@ -5,48 +5,113 @@ package isolation
 
 import (
 	gomock "github.com/golang/mock/gomock"
+	go_ps "github.com/mitchellh/go-ps"
+	mountinfo "github.com/moby/sys/mountinfo"
 
-	v1 "kubevirt.io/kubevirt/pkg/api/v1"
+	safepath "kubevirt.io/kubevirt/pkg/safepath"
 )
 
-// Mock of PodIsolationDetector interface
-type MockPodIsolationDetector struct {
+// Mock of IsolationResult interface
+type MockIsolationResult struct {
 	ctrl     *gomock.Controller
-	recorder *_MockPodIsolationDetectorRecorder
+	recorder *_MockIsolationResultRecorder
 }
 
-// Recorder for MockPodIsolationDetector (not exported)
-type _MockPodIsolationDetectorRecorder struct {
-	mock *MockPodIsolationDetector
+// Recorder for MockIsolationResult (not exported)
+type _MockIsolationResultRecorder struct {
+	mock *MockIsolationResult
 }
 
-func NewMockPodIsolationDetector(ctrl *gomock.Controller) *MockPodIsolationDetector {
-	mock := &MockPodIsolationDetector{ctrl: ctrl}
-	mock.recorder = &_MockPodIsolationDetectorRecorder{mock}
+func NewMockIsolationResult(ctrl *gomock.Controller) *MockIsolationResult {
+	mock := &MockIsolationResult{ctrl: ctrl}
+	mock.recorder = &_MockIsolationResultRecorder{mock}
 	return mock
 }
 
-func (_m *MockPodIsolationDetector) EXPECT() *_MockPodIsolationDetectorRecorder {
+func (_m *MockIsolationResult) EXPECT() *_MockIsolationResultRecorder {
 	return _m.recorder
 }
 
-func (_m *MockPodIsolationDetector) Detect(vm *v1.VirtualMachineInstance) (*IsolationResult, error) {
-	ret := _m.ctrl.Call(_m, "Detect", vm)
-	ret0, _ := ret[0].(*IsolationResult)
+func (_m *MockIsolationResult) Pid() int {
+	ret := _m.ctrl.Call(_m, "Pid")
+	ret0, _ := ret[0].(int)
+	return ret0
+}
+
+func (_mr *_MockIsolationResultRecorder) Pid() *gomock.Call {
+	return _mr.mock.ctrl.RecordCall(_mr.mock, "Pid")
+}
+
+func (_m *MockIsolationResult) PPid() int {
+	ret := _m.ctrl.Call(_m, "PPid")
+	ret0, _ := ret[0].(int)
+	return ret0
+}
+
+func (_mr *_MockIsolationResultRecorder) PPid() *gomock.Call {
+	return _mr.mock.ctrl.RecordCall(_mr.mock, "PPid")
+}
+
+func (_m *MockIsolationResult) PIDNamespace() string {
+	ret := _m.ctrl.Call(_m, "PIDNamespace")
+	ret0, _ := ret[0].(string)
+	return ret0
+}
+
+func (_mr *_MockIsolationResultRecorder) PIDNamespace() *gomock.Call {
+	return _mr.mock.ctrl.RecordCall(_mr.mock, "PIDNamespace")
+}
+
+func (_m *MockIsolationResult) MountRoot() (*safepath.Path, error) {
+	ret := _m.ctrl.Call(_m, "MountRoot")
+	ret0, _ := ret[0].(*safepath.Path)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
-func (_mr *_MockPodIsolationDetectorRecorder) Detect(arg0 interface{}) *gomock.Call {
-	return _mr.mock.ctrl.RecordCall(_mr.mock, "Detect", arg0)
+func (_mr *_MockIsolationResultRecorder) MountRoot() *gomock.Call {
+	return _mr.mock.ctrl.RecordCall(_mr.mock, "MountRoot")
 }
 
-func (_m *MockPodIsolationDetector) Whitelist(controller []string) PodIsolationDetector {
-	ret := _m.ctrl.Call(_m, "Whitelist", controller)
-	ret0, _ := ret[0].(PodIsolationDetector)
+func (_m *MockIsolationResult) MountNamespace() string {
+	ret := _m.ctrl.Call(_m, "MountNamespace")
+	ret0, _ := ret[0].(string)
 	return ret0
 }
 
-func (_mr *_MockPodIsolationDetectorRecorder) Whitelist(arg0 interface{}) *gomock.Call {
-	return _mr.mock.ctrl.RecordCall(_mr.mock, "Whitelist", arg0)
+func (_mr *_MockIsolationResultRecorder) MountNamespace() *gomock.Call {
+	return _mr.mock.ctrl.RecordCall(_mr.mock, "MountNamespace")
+}
+
+func (_m *MockIsolationResult) Mounts(_param0 mountinfo.FilterFunc) ([]*mountinfo.Info, error) {
+	ret := _m.ctrl.Call(_m, "Mounts", _param0)
+	ret0, _ := ret[0].([]*mountinfo.Info)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+func (_mr *_MockIsolationResultRecorder) Mounts(arg0 interface{}) *gomock.Call {
+	return _mr.mock.ctrl.RecordCall(_mr.mock, "Mounts", arg0)
+}
+
+func (_m *MockIsolationResult) GetQEMUProcess() (go_ps.Process, error) {
+	ret := _m.ctrl.Call(_m, "GetQEMUProcess")
+	ret0, _ := ret[0].(go_ps.Process)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+func (_mr *_MockIsolationResultRecorder) GetQEMUProcess() *gomock.Call {
+	return _mr.mock.ctrl.RecordCall(_mr.mock, "GetQEMUProcess")
+}
+
+func (_m *MockIsolationResult) KvmPitPid() (int, error) {
+	ret := _m.ctrl.Call(_m, "KvmPitPid")
+	ret0, _ := ret[0].(int)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+func (_mr *_MockIsolationResultRecorder) KvmPitPid() *gomock.Call {
+	return _mr.mock.ctrl.RecordCall(_mr.mock, "KvmPitPid")
 }

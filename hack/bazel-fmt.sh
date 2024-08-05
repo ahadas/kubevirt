@@ -20,18 +20,19 @@
 set -e
 
 source hack/common.sh
+source hack/bootstrap.sh
+source hack/config.sh
 
-shfmt -i 4 -w ${KUBEVIRT_DIR}/cluster/ ${KUBEVIRT_DIR}/hack/ ${KUBEVIRT_DIR}/images/
 bazel run \
-    --platforms=@io_bazel_rules_go//go/toolchain:linux_amd64 \
-    --workspace_status_command=./hack/print-workspace-status.sh \
+    --config=${HOST_ARCHITECTURE} \
+    //vendor/mvdan.cc/sh/v3/cmd/shfmt:shfmt -- -i 4 -w ${KUBEVIRT_DIR}/hack/ ${KUBEVIRT_DIR}/images/
+bazel run \
+    --config=${HOST_ARCHITECTURE} \
     //:gazelle -- pkg/ tools/ tests/ cmd/
 bazel run \
-    --platforms=@io_bazel_rules_go//go/toolchain:linux_amd64 \
-    --workspace_status_command=./hack/print-workspace-status.sh \
+    --config=${HOST_ARCHITECTURE} \
     //:goimports
-# allign BAZEL files to a single format
+# align BAZEL files to a single format
 bazel run \
-    --platforms=@io_bazel_rules_go//go/toolchain:linux_amd64 \
-    --workspace_status_command=./hack/print-workspace-status.sh \
+    --config=${HOST_ARCHITECTURE} \
     //:buildifier

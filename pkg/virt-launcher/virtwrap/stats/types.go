@@ -41,6 +41,13 @@ package stats
 // and make necessary changes in the cmd rpc implementation!
 const (
 	DomainStatsVersion = "v1"
+
+	// VIR_VCPU_OFFLINE    = 0,    /* the virtual CPU is offline */
+	VCPUOffline = 0
+	//  VIR_VCPU_RUNNING    = 1,    /* the virtual CPU is running */
+	VCPURunning = 1
+	//  VIR_VCPU_BLOCKED    = 2,    /* the virtual CPU is blocked on resource */
+	VCPUBlocked = 2
 )
 
 type DomainStats struct {
@@ -53,11 +60,17 @@ type DomainStats struct {
 	Cpu *DomainStatsCPU
 	// new, see below
 	Memory *DomainStatsMemory
+	// omitted from libvirt-go: DomainJobInfo
+	MigrateDomainJobInfo *DomainJobInfo
 	// omitted from libvirt-go: Balloon
 	Vcpu  []DomainStatsVcpu
 	Net   []DomainStatsNet
 	Block []DomainStatsBlock
 	// omitted from libvirt-go: Perf
+	// extra stats
+	CPUMapSet bool
+	CPUMap    [][]bool
+	NrVirtCpu uint
 }
 
 type DomainStatsCPU struct {
@@ -74,11 +87,17 @@ type DomainStatsVcpu struct {
 	State    int // VcpuState
 	TimeSet  bool
 	Time     uint64
+	WaitSet  bool
+	Wait     uint64
+	DelaySet bool
+	Delay    uint64
 }
 
 type DomainStatsNet struct {
 	NameSet    bool
 	Name       string
+	AliasSet   bool
+	Alias      string
 	RxBytesSet bool
 	RxBytes    uint64
 	RxPktsSet  bool
@@ -100,6 +119,7 @@ type DomainStatsNet struct {
 type DomainStatsBlock struct {
 	NameSet         bool
 	Name            string
+	Alias           string
 	BackingIndexSet bool
 	BackingIndex    uint
 	PathSet         bool
@@ -135,6 +155,8 @@ type DomainStatsBlock struct {
 type DomainStatsMemory struct {
 	UnusedSet        bool
 	Unused           uint64
+	CachedSet        bool
+	Cached           uint64
 	AvailableSet     bool
 	Available        uint64
 	ActualBalloonSet bool
@@ -145,4 +167,25 @@ type DomainStatsMemory struct {
 	SwapIn           uint64
 	SwapOutSet       bool
 	SwapOut          uint64
+	MajorFaultSet    bool
+	MajorFault       uint64
+	MinorFaultSet    bool
+	MinorFault       uint64
+	UsableSet        bool
+	Usable           uint64
+	TotalSet         bool
+	Total            uint64
+}
+
+// mimic existing structs, but data is taken from
+// DomainJobInfo
+type DomainJobInfo struct {
+	DataProcessedSet bool
+	DataProcessed    uint64
+	MemoryBpsSet     bool
+	MemoryBps        uint64
+	DataRemainingSet bool
+	DataRemaining    uint64
+	MemDirtyRateSet  bool
+	MemDirtyRate     uint64
 }

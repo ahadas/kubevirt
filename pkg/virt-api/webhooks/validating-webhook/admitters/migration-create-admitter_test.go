@@ -20,190 +20,97 @@
 package admitters
 
 import (
+	"context"
 	"encoding/json"
 
-	. "github.com/onsi/ginkgo"
-	"github.com/onsi/ginkgo/extensions/table"
+	"github.com/golang/mock/gomock"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"k8s.io/api/admission/v1beta1"
+	admissionv1 "k8s.io/api/admission/v1"
 	k8sv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 
-	v1 "kubevirt.io/kubevirt/pkg/api/v1"
+	"kubevirt.io/client-go/api"
+
+	v1 "kubevirt.io/api/core/v1"
+	"kubevirt.io/client-go/kubecli"
+
 	"kubevirt.io/kubevirt/pkg/testutils"
 	"kubevirt.io/kubevirt/pkg/virt-api/webhooks"
-	virtconfig "kubevirt.io/kubevirt/pkg/virt-config"
+	"kubevirt.io/kubevirt/pkg/virt-config/deprecation"
 )
 
 var _ = Describe("Validating MigrationCreate Admitter", func() {
-	config, configMapInformer := testutils.NewFakeClusterConfig(&k8sv1.ConfigMap{})
-	migrationCreateAdmitter := &MigrationCreateAdmitter{ClusterConfig: config}
+	config, _, kvStore := testutils.NewFakeClusterConfigUsingKVConfig(&v1.KubeVirtConfiguration{})
+
+	// Mock VirtualMachineInstanceMigration
+	var ctrl *gomock.Controller
+	var virtClient *kubecli.MockKubevirtClient
+	var migrationCreateAdmitter *MigrationCreateAdmitter
+	var migrationInterface *kubecli.MockVirtualMachineInstanceMigrationInterface
+	var mockVMIClient *kubecli.MockVirtualMachineInstanceInterface
 
 	enableFeatureGate := func(featureGate string) {
-		testutils.UpdateFakeClusterConfig(configMapInformer, &k8sv1.ConfigMap{
-			Data: map[string]string{virtconfig.FeatureGatesKey: featureGate},
+		testutils.UpdateFakeKubeVirtClusterConfig(kvStore, &v1.KubeVirt{
+			Spec: v1.KubeVirtSpec{
+				Configuration: v1.KubeVirtConfiguration{
+					DeveloperConfiguration: &v1.DeveloperConfiguration{
+						FeatureGates: []string{featureGate},
+					},
+				},
+			},
 		})
 	}
 	disableFeatureGates := func() {
-		testutils.UpdateFakeClusterConfig(configMapInformer, &k8sv1.ConfigMap{})
+		testutils.UpdateFakeKubeVirtClusterConfig(kvStore, &v1.KubeVirt{
+			Spec: v1.KubeVirtSpec{
+				Configuration: v1.KubeVirtConfiguration{
+					DeveloperConfiguration: &v1.DeveloperConfiguration{
+						FeatureGates: make([]string, 0),
+					},
+				},
+			},
+		})
 	}
 
-	AfterEach(func() {
-		disableFeatureGates()
-	})
-
-	It("should reject invalid Migration spec on create", func() {
-		migration := v1.VirtualMachineInstanceMigration{
-			ObjectMeta: metav1.ObjectMeta{
-				Namespace: "default",
-			},
-			Spec: v1.VirtualMachineInstanceMigrationSpec{
-				VMIName: "",
-			},
-		}
-		migrationBytes, _ := json.Marshal(&migration)
-
-		enableFeatureGate("LiveMigration")
-
-		ar := &v1beta1.AdmissionReview{
-			Request: &v1beta1.AdmissionRequest{
-				Resource: webhooks.MigrationGroupVersionResource,
-				Object: runtime.RawExtension{
-					Raw: migrationBytes,
-				},
-			},
-		}
-
-		resp := migrationCreateAdmitter.Admit(ar)
-		Expect(resp.Allowed).To(Equal(false))
-		Expect(len(resp.Result.Details.Causes)).To(Equal(1))
-		Expect(resp.Result.Details.Causes[0].Field).To(Equal("spec.vmiName"))
-	})
-
-	It("should accept valid Migration spec on create", func() {
-		vmi := v1.NewMinimalVMI("testvmimigrate1")
-
-		informers := webhooks.GetInformers()
-		informers.VMIInformer.GetIndexer().Add(vmi)
-
-		migration := v1.VirtualMachineInstanceMigration{
-			ObjectMeta: metav1.ObjectMeta{
-				Namespace: vmi.Namespace,
-			},
-			Spec: v1.VirtualMachineInstanceMigrationSpec{
-				VMIName: "testvmimigrate1",
-			},
-		}
-		migrationBytes, _ := json.Marshal(&migration)
-
-		enableFeatureGate("LiveMigration")
-
-		ar := &v1beta1.AdmissionReview{
-			Request: &v1beta1.AdmissionRequest{
-				Resource: webhooks.MigrationGroupVersionResource,
-				Object: runtime.RawExtension{
-					Raw: migrationBytes,
-				},
-			},
-		}
-
-		resp := migrationCreateAdmitter.Admit(ar)
-		Expect(resp.Allowed).To(Equal(true))
-	})
-
-	It("should reject valid Migration spec on create when feature gate isn't enabled", func() {
-		vmi := v1.NewMinimalVMI("testvmimigrate1")
-
-		informers := webhooks.GetInformers()
-		informers.VMIInformer.GetIndexer().Add(vmi)
-
-		migration := v1.VirtualMachineInstanceMigration{
-			ObjectMeta: metav1.ObjectMeta{
-				Namespace: vmi.Namespace,
-			},
-			Spec: v1.VirtualMachineInstanceMigrationSpec{
-				VMIName: "testvmimigrate1",
-			},
-		}
-		migrationBytes, _ := json.Marshal(&migration)
-
-		disableFeatureGates()
-
-		ar := &v1beta1.AdmissionReview{
-			Request: &v1beta1.AdmissionRequest{
-				Resource: webhooks.MigrationGroupVersionResource,
-				Object: runtime.RawExtension{
-					Raw: migrationBytes,
-				},
-			},
-		}
-
-		resp := migrationCreateAdmitter.Admit(ar)
-		Expect(resp.Allowed).To(Equal(false))
+	BeforeEach(func() {
+		ctrl = gomock.NewController(GinkgoT())
+		migrationInterface = kubecli.NewMockVirtualMachineInstanceMigrationInterface(ctrl)
+		mockVMIClient = kubecli.NewMockVirtualMachineInstanceInterface(ctrl)
+		virtClient = kubecli.NewMockKubevirtClient(ctrl)
+		virtClient.EXPECT().VirtualMachineInstanceMigration("default").Return(migrationInterface).AnyTimes()
+		virtClient.EXPECT().VirtualMachineInstance(gomock.Any()).Return(mockVMIClient).AnyTimes()
+		migrationCreateAdmitter = &MigrationCreateAdmitter{ClusterConfig: config, VirtClient: virtClient}
 	})
 
 	It("should reject Migration spec on create when another VMI migration is in-flight", func() {
-		vmi := v1.NewMinimalVMI("testmigratevmi2")
-		vmi.Status.MigrationState = &v1.VirtualMachineInstanceMigrationState{
-			MigrationUID: "123",
-			Completed:    false,
-			Failed:       false,
-		}
-
-		informers := webhooks.GetInformers()
-		informers.VMIInformer.GetIndexer().Add(vmi)
-
-		migration := v1.VirtualMachineInstanceMigration{
+		vmi := api.NewMinimalVMI("testmigratevmi2")
+		inFlightMigration := v1.VirtualMachineInstanceMigration{
 			ObjectMeta: metav1.ObjectMeta{
-				Namespace: "default",
+				Namespace: vmi.Namespace,
 			},
 			Spec: v1.VirtualMachineInstanceMigrationSpec{
-				VMIName: "testmigratevmi2",
+				VMIName: vmi.Name,
 			},
 		}
-		migrationBytes, _ := json.Marshal(&migration)
-
-		enableFeatureGate("LiveMigration")
-
-		ar := &v1beta1.AdmissionReview{
-			Request: &v1beta1.AdmissionRequest{
-				Resource: webhooks.MigrationGroupVersionResource,
-				Object: runtime.RawExtension{
-					Raw: migrationBytes,
-				},
-			},
-		}
-
-		resp := migrationCreateAdmitter.Admit(ar)
-		Expect(resp.Allowed).To(Equal(false))
-	})
-
-	It("should accept Migration spec on create when previous VMI migration completed", func() {
-		vmi := v1.NewMinimalVMI("testmigratevmi4")
-		vmi.Status.MigrationState = &v1.VirtualMachineInstanceMigrationState{
-			MigrationUID: "123",
-			Completed:    true,
-			Failed:       false,
-		}
-
-		informers := webhooks.GetInformers()
-		informers.VMIInformer.GetIndexer().Add(vmi)
+		mockVMIClient.EXPECT().Get(context.Background(), inFlightMigration.Spec.VMIName, gomock.Any()).Return(vmi, nil)
+		migrationInterface.EXPECT().List(context.Background(), gomock.Any()).Return(kubecli.NewMigrationList(inFlightMigration), nil).AnyTimes()
 
 		migration := v1.VirtualMachineInstanceMigration{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: vmi.Namespace,
 			},
 			Spec: v1.VirtualMachineInstanceMigrationSpec{
-				VMIName: "testmigratevmi4",
+				VMIName: vmi.Name,
 			},
 		}
 		migrationBytes, _ := json.Marshal(&migration)
 
-		enableFeatureGate("LiveMigration")
+		enableFeatureGate(deprecation.LiveMigrationGate)
 
-		ar := &v1beta1.AdmissionReview{
-			Request: &v1beta1.AdmissionRequest{
+		ar := &admissionv1.AdmissionReview{
+			Request: &admissionv1.AdmissionRequest{
 				Resource: webhooks.MigrationGroupVersionResource,
 				Object: runtime.RawExtension{
 					Raw: migrationBytes,
@@ -212,113 +119,216 @@ var _ = Describe("Validating MigrationCreate Admitter", func() {
 		}
 
 		resp := migrationCreateAdmitter.Admit(ar)
-		Expect(resp.Allowed).To(Equal(true))
-	})
-
-	It("should reject Migration spec on create when VMI is finalized", func() {
-		vmi := v1.NewMinimalVMI("testmigratevmi3")
-		vmi.Status.Phase = v1.Succeeded
-
-		informers := webhooks.GetInformers()
-		informers.VMIInformer.GetIndexer().Add(vmi)
-
-		migration := v1.VirtualMachineInstanceMigration{
-			ObjectMeta: metav1.ObjectMeta{
-				Namespace: "default",
-			},
-			Spec: v1.VirtualMachineInstanceMigrationSpec{
-				VMIName: "testmigratevmi3",
-			},
-		}
-		migrationBytes, _ := json.Marshal(&migration)
-
-		enableFeatureGate("LiveMigration")
-
-		ar := &v1beta1.AdmissionReview{
-			Request: &v1beta1.AdmissionRequest{
-				Resource: webhooks.MigrationGroupVersionResource,
-				Object: runtime.RawExtension{
-					Raw: migrationBytes,
-				},
-			},
-		}
-
-		resp := migrationCreateAdmitter.Admit(ar)
-		Expect(resp.Allowed).To(Equal(false))
-	})
-
-	It("should reject Migration spec for non-migratable VMIs", func() {
-		vmi := v1.NewMinimalVMI("testmigratevmi3")
-		vmi.Status.Phase = v1.Running
-		vmi.Status.Conditions = []v1.VirtualMachineInstanceCondition{
-			{
-				Type:    v1.VirtualMachineInstanceIsMigratable,
-				Status:  k8sv1.ConditionFalse,
-				Reason:  v1.VirtualMachineInstanceReasonDisksNotMigratable,
-				Message: "cannot migrate VMI with mixes shared and non-shared volumes",
-			},
-			{
-				Type:   v1.VirtualMachineInstanceReady,
-				Status: k8sv1.ConditionTrue,
-			},
-		}
-
-		informers := webhooks.GetInformers()
-		informers.VMIInformer.GetIndexer().Add(vmi)
-
-		migration := v1.VirtualMachineInstanceMigration{
-			ObjectMeta: metav1.ObjectMeta{
-				Namespace: "default",
-			},
-			Spec: v1.VirtualMachineInstanceMigrationSpec{
-				VMIName: "testmigratevmi3",
-			},
-		}
-		migrationBytes, _ := json.Marshal(&migration)
-
-		enableFeatureGate("LiveMigration")
-
-		ar := &v1beta1.AdmissionReview{
-			Request: &v1beta1.AdmissionRequest{
-				Resource: webhooks.MigrationGroupVersionResource,
-				Object: runtime.RawExtension{
-					Raw: migrationBytes,
-				},
-			},
-		}
-
-		resp := migrationCreateAdmitter.Admit(ar)
-		Expect(resp.Allowed).To(Equal(false))
-		Expect(resp.Result.Message).To(ContainSubstring("DisksNotLiveMigratable"))
-	})
-
-	table.DescribeTable("should reject documents containing unknown or missing fields for", func(data string, validationResult string, gvr metav1.GroupVersionResource, review func(ar *v1beta1.AdmissionReview) *v1beta1.AdmissionResponse) {
-		input := map[string]interface{}{}
-		json.Unmarshal([]byte(data), &input)
-
-		ar := &v1beta1.AdmissionReview{
-			Request: &v1beta1.AdmissionRequest{
-				Resource: gvr,
-				Object: runtime.RawExtension{
-					Raw: []byte(data),
-				},
-			},
-		}
-		resp := review(ar)
 		Expect(resp.Allowed).To(BeFalse())
-		Expect(resp.Result.Message).To(Equal(validationResult))
-	},
-		table.Entry("Migration creation ",
-			`{"very": "unknown", "spec": { "extremely": "unknown" }}`,
-			`.very in body is a forbidden property, spec.extremely in body is a forbidden property`,
-			webhooks.MigrationGroupVersionResource,
-			migrationCreateAdmitter.Admit,
-		),
-		table.Entry("Migration update",
-			`{"very": "unknown", "spec": { "extremely": "unknown" }}`,
-			`.very in body is a forbidden property, spec.extremely in body is a forbidden property`,
-			webhooks.MigrationGroupVersionResource,
-			migrationCreateAdmitter.Admit,
-		),
-	)
+	})
+
+	Context("with no conflicting migration", func() {
+
+		BeforeEach(func() {
+			migrationInterface.EXPECT().List(context.Background(), gomock.Any()).Return(&v1.VirtualMachineInstanceMigrationList{}, nil).MaxTimes(1)
+
+		})
+
+		AfterEach(func() {
+			disableFeatureGates()
+		})
+
+		It("should reject invalid Migration spec on create", func() {
+			migration := v1.VirtualMachineInstanceMigration{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+				},
+				Spec: v1.VirtualMachineInstanceMigrationSpec{
+					VMIName: "",
+				},
+			}
+			migrationBytes, _ := json.Marshal(&migration)
+
+			enableFeatureGate(deprecation.LiveMigrationGate)
+
+			ar := &admissionv1.AdmissionReview{
+				Request: &admissionv1.AdmissionRequest{
+					Resource: webhooks.MigrationGroupVersionResource,
+					Object: runtime.RawExtension{
+						Raw: migrationBytes,
+					},
+				},
+			}
+
+			resp := migrationCreateAdmitter.Admit(ar)
+			Expect(resp.Allowed).To(BeFalse())
+			Expect(resp.Result.Details.Causes).To(HaveLen(1))
+			Expect(resp.Result.Details.Causes[0].Field).To(Equal("spec.vmiName"))
+		})
+
+		It("should accept valid Migration spec on create", func() {
+			vmi := api.NewMinimalVMI("testvmimigrate1")
+
+			mockVMIClient.EXPECT().Get(context.Background(), vmi.Name, gomock.Any()).Return(vmi, nil)
+
+			migration := v1.VirtualMachineInstanceMigration{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: vmi.Namespace,
+				},
+				Spec: v1.VirtualMachineInstanceMigrationSpec{
+					VMIName: "testvmimigrate1",
+				},
+			}
+			migrationBytes, _ := json.Marshal(&migration)
+
+			enableFeatureGate(deprecation.LiveMigrationGate)
+
+			ar := &admissionv1.AdmissionReview{
+				Request: &admissionv1.AdmissionRequest{
+					Resource: webhooks.MigrationGroupVersionResource,
+					Object: runtime.RawExtension{
+						Raw: migrationBytes,
+					},
+				},
+			}
+
+			resp := migrationCreateAdmitter.Admit(ar)
+			Expect(resp.Allowed).To(BeTrue())
+		})
+
+		It("should accept Migration spec on create when previous VMI migration completed", func() {
+			vmi := api.NewMinimalVMI("testmigratevmi4")
+			vmi.Status.MigrationState = &v1.VirtualMachineInstanceMigrationState{
+				MigrationUID: "123",
+				Completed:    true,
+				Failed:       false,
+			}
+
+			mockVMIClient.EXPECT().Get(context.Background(), vmi.Name, gomock.Any()).Return(vmi, nil)
+
+			migration := v1.VirtualMachineInstanceMigration{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: vmi.Namespace,
+				},
+				Spec: v1.VirtualMachineInstanceMigrationSpec{
+					VMIName: "testmigratevmi4",
+				},
+			}
+			migrationBytes, _ := json.Marshal(&migration)
+
+			enableFeatureGate(deprecation.LiveMigrationGate)
+
+			ar := &admissionv1.AdmissionReview{
+				Request: &admissionv1.AdmissionRequest{
+					Resource: webhooks.MigrationGroupVersionResource,
+					Object: runtime.RawExtension{
+						Raw: migrationBytes,
+					},
+				},
+			}
+
+			resp := migrationCreateAdmitter.Admit(ar)
+			Expect(resp.Allowed).To(BeTrue())
+		})
+
+		It("should reject Migration spec on create when VMI is finalized", func() {
+			vmi := api.NewMinimalVMI("testmigratevmi3")
+			vmi.Status.Phase = v1.Succeeded
+
+			mockVMIClient.EXPECT().Get(context.Background(), vmi.Name, gomock.Any()).Return(vmi, nil)
+
+			migration := v1.VirtualMachineInstanceMigration{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+				},
+				Spec: v1.VirtualMachineInstanceMigrationSpec{
+					VMIName: "testmigratevmi3",
+				},
+			}
+			migrationBytes, _ := json.Marshal(&migration)
+
+			enableFeatureGate(deprecation.LiveMigrationGate)
+
+			ar := &admissionv1.AdmissionReview{
+				Request: &admissionv1.AdmissionRequest{
+					Resource: webhooks.MigrationGroupVersionResource,
+					Object: runtime.RawExtension{
+						Raw: migrationBytes,
+					},
+				},
+			}
+
+			resp := migrationCreateAdmitter.Admit(ar)
+			Expect(resp.Allowed).To(BeFalse())
+		})
+
+		It("should reject Migration spec for non-migratable VMIs", func() {
+			vmi := api.NewMinimalVMI("testmigratevmi3")
+			vmi.Status.Phase = v1.Running
+			vmi.Status.Conditions = []v1.VirtualMachineInstanceCondition{
+				{
+					Type:    v1.VirtualMachineInstanceIsMigratable,
+					Status:  k8sv1.ConditionFalse,
+					Reason:  v1.VirtualMachineInstanceReasonDisksNotMigratable,
+					Message: "cannot migrate VMI with mixes shared and non-shared volumes",
+				},
+				{
+					Type:   v1.VirtualMachineInstanceReady,
+					Status: k8sv1.ConditionTrue,
+				},
+			}
+
+			mockVMIClient.EXPECT().Get(context.Background(), vmi.Name, gomock.Any()).Return(vmi, nil)
+
+			migration := v1.VirtualMachineInstanceMigration{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+				},
+				Spec: v1.VirtualMachineInstanceMigrationSpec{
+					VMIName: "testmigratevmi3",
+				},
+			}
+			migrationBytes, _ := json.Marshal(&migration)
+
+			enableFeatureGate(deprecation.LiveMigrationGate)
+
+			ar := &admissionv1.AdmissionReview{
+				Request: &admissionv1.AdmissionRequest{
+					Resource: webhooks.MigrationGroupVersionResource,
+					Object: runtime.RawExtension{
+						Raw: migrationBytes,
+					},
+				},
+			}
+
+			resp := migrationCreateAdmitter.Admit(ar)
+			Expect(resp.Allowed).To(BeFalse())
+			Expect(resp.Result.Message).To(ContainSubstring("DisksNotLiveMigratable"))
+		})
+
+		DescribeTable("should reject documents containing unknown or missing fields for", func(data string, validationResult string, gvr metav1.GroupVersionResource, review func(ar *admissionv1.AdmissionReview) *admissionv1.AdmissionResponse) {
+			input := map[string]interface{}{}
+			json.Unmarshal([]byte(data), &input)
+
+			ar := &admissionv1.AdmissionReview{
+				Request: &admissionv1.AdmissionRequest{
+					Resource: gvr,
+					Object: runtime.RawExtension{
+						Raw: []byte(data),
+					},
+				},
+			}
+			resp := review(ar)
+			Expect(resp.Allowed).To(BeFalse())
+			Expect(resp.Result.Message).To(Equal(validationResult))
+		},
+			Entry("Migration creation ",
+				`{"very": "unknown", "spec": { "extremely": "unknown" }}`,
+				`.very in body is a forbidden property, spec.extremely in body is a forbidden property`,
+				webhooks.MigrationGroupVersionResource,
+				migrationCreateAdmitter.Admit,
+			),
+			Entry("Migration update",
+				`{"very": "unknown", "spec": { "extremely": "unknown" }}`,
+				`.very in body is a forbidden property, spec.extremely in body is a forbidden property`,
+				webhooks.MigrationGroupVersionResource,
+				migrationCreateAdmitter.Admit,
+			),
+		)
+	})
 })

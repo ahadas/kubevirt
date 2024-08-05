@@ -20,37 +20,35 @@
 package tests_test
 
 import (
-	"flag"
 	"fmt"
 	"runtime"
 
-	. "github.com/onsi/ginkgo"
+	"kubevirt.io/kubevirt/tests/decorators"
+	"kubevirt.io/kubevirt/tests/framework/kubevirt"
+
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"kubevirt.io/kubevirt/pkg/kubecli"
-	"kubevirt.io/kubevirt/tests"
+	"kubevirt.io/client-go/kubecli"
 )
 
-var _ = Describe("Version", func() {
+var _ = Describe("[sig-compute]Version", decorators.SigCompute, func() {
 
-	flag.Parse()
-
-	virtClient, err := kubecli.GetKubevirtClient()
-	tests.PanicOnError(err)
+	var virtClient kubecli.KubevirtClient
 
 	BeforeEach(func() {
-		tests.BeforeTestCleanup()
+		virtClient = kubevirt.Client()
 	})
 
 	Describe("Check that version parameters where loaded by ldflags in build time", func() {
-		It("Should return a good version information struct", func() {
+		It("[test_id:555]Should return a good version information struct", func() {
 			info, err := virtClient.ServerVersion().Get()
 			Expect(err).ToNot(HaveOccurred())
 			Expect(info.Compiler).To(Equal(runtime.Compiler))
 			Expect(info.Platform).To(Equal(fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH)))
-			Expect(info.GitVersion).To(Not(Equal("v0.0.0-master+$Format:%h$")))
-			Expect(info.GitCommit).To(Not(Equal("$Format:%H$")))
-			Expect(info.BuildDate).To(Not(Equal("1970-01-01T00:00:00Z")))
+			Expect(info.GitVersion).To(Not(SatisfyAny(Equal("v0.0.0-master+$Format:%h$"), Equal("{gitVersion}"))))
+			Expect(info.GitCommit).To(Not(SatisfyAny(Equal("$Format:%H$"), Equal("{gitCommit}"))))
+			Expect(info.BuildDate).To(Not(SatisfyAny(Equal("1970-01-01T00:00:00Z"), Equal("{buildDate}"))))
 		})
 	})
 

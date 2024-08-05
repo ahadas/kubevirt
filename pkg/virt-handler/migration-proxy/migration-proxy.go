@@ -26,10 +26,16 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 
-	"kubevirt.io/kubevirt/pkg/log"
+	"kubevirt.io/client-go/log"
+
+	diskutils "kubevirt.io/kubevirt/pkg/ephemeral-disk-utils"
+	"kubevirt.io/kubevirt/pkg/util"
+	"kubevirt.io/kubevirt/pkg/util/net/ip"
+	virtconfig "kubevirt.io/kubevirt/pkg/virt-config"
 )
 
 const (
@@ -41,20 +47,32 @@ var migrationPortsRange = []int{LibvirtDirectMigrationPort, LibvirtBlockMigratio
 
 type ProxyManager interface {
 	StartTargetListener(key string, targetUnixFiles []string) error
-	GetTargetListenerPorts(key string) map[int]int
+	GetTargetListenerPorts(key string) map[string]int
 	StopTargetListener(key string)
 
-	StartSourceListener(key string, targetAddress string, destSrcPortMap map[int]int) error
+	StartSourceListener(key string, targetAddress string, destSrcPortMap map[string]int, baseDir string) error
 	GetSourceListenerFiles(key string) []string
 	StopSourceListener(key string)
+
+	OpenListenerCount() int
+
+	InitiateGracefulShutdown()
 }
 
 type migrationProxyManager struct {
-	virtShareDir  string
-	sourceProxies map[string][]*migrationProxy
-	targetProxies map[string][]*migrationProxy
-	managerLock   sync.Mutex
-	tlsConfig     *tls.Config
+	sourceProxies   map[string][]*migrationProxy
+	targetProxies   map[string][]*migrationProxy
+	managerLock     sync.Mutex
+	serverTLSConfig *tls.Config
+	clientTLSConfig *tls.Config
+
+	isShuttingDown bool
+	config         *virtconfig.ClusterConfig
+}
+
+type MigrationProxyListener interface {
+	Start() error
+	Stop()
 }
 
 type migrationProxy struct {
@@ -67,8 +85,25 @@ type migrationProxy struct {
 	listenErrChan  chan error
 	fdChan         chan net.Conn
 
-	listener  net.Listener
-	tlsConfig *tls.Config
+	listener        net.Listener
+	serverTLSConfig *tls.Config
+	clientTLSConfig *tls.Config
+
+	logger *log.FilteredLogger
+}
+
+func (m *migrationProxyManager) InitiateGracefulShutdown() {
+	m.managerLock.Lock()
+	defer m.managerLock.Unlock()
+
+	m.isShuttingDown = true
+}
+
+func (m *migrationProxyManager) OpenListenerCount() int {
+	m.managerLock.Lock()
+	defer m.managerLock.Unlock()
+
+	return len(m.sourceProxies) + len(m.targetProxies)
 }
 
 func GetMigrationPortsList(isBlockMigration bool) (ports []int) {
@@ -79,22 +114,28 @@ func GetMigrationPortsList(isBlockMigration bool) (ports []int) {
 	return
 }
 
-func NewMigrationProxyManager(virtShareDir string, tlsConfig *tls.Config) ProxyManager {
+func NewMigrationProxyManager(serverTLSConfig *tls.Config, clientTLSConfig *tls.Config, config *virtconfig.ClusterConfig) ProxyManager {
 	return &migrationProxyManager{
-		virtShareDir:  virtShareDir,
-		sourceProxies: make(map[string][]*migrationProxy),
-		targetProxies: make(map[string][]*migrationProxy),
-		tlsConfig:     tlsConfig,
+		sourceProxies:   make(map[string][]*migrationProxy),
+		targetProxies:   make(map[string][]*migrationProxy),
+		serverTLSConfig: serverTLSConfig,
+		clientTLSConfig: clientTLSConfig,
+		config:          config,
 	}
 }
 
-func SourceUnixFile(virtShareDir string, key string) string {
-	return filepath.Join(virtShareDir, "migrationproxy", key+"-source.sock")
+func SourceUnixFile(baseDir string, key string) string {
+	return filepath.Join(baseDir, "migrationproxy", key+"-source.sock")
 }
 
 func (m *migrationProxyManager) StartTargetListener(key string, targetUnixFiles []string) error {
 	m.managerLock.Lock()
 	defer m.managerLock.Unlock()
+
+	if m.isShuttingDown {
+		return fmt.Errorf("unable to process new migration connections during virt-handler shutdown")
+	}
+
 	isExistingProxy := func(curProxies []*migrationProxy, targetUnixFiles []string) bool {
 		// make sure that all elements in the existing proxy match to the provided targetUnixFiles
 		if len(curProxies) != len(targetUnixFiles) {
@@ -120,27 +161,35 @@ func (m *migrationProxyManager) StartTargetListener(key string, targetUnixFiles 
 		} else {
 			// stop the current proxy and point it somewhere new.
 			for _, curProxy := range curProxies {
-				curProxy.StopListening()
+				curProxy.logger.Infof("Manager stopping proxy on target node due to new unix filepath location")
+				curProxy.Stop()
 			}
 		}
 	}
 
+	zeroAddress := ip.GetIPZeroAddress()
 	proxiesList := []*migrationProxy{}
+	serverTLSConfig := m.serverTLSConfig
+	clientTLSConfig := m.clientTLSConfig
+	if m.config.GetMigrationConfiguration().DisableTLS != nil && *m.config.GetMigrationConfiguration().DisableTLS {
+		serverTLSConfig = nil
+		clientTLSConfig = nil
+	}
 	for _, targetUnixFile := range targetUnixFiles {
 		// 0 means random port is used
-		proxy := NewTargetProxy("0.0.0.0", 0, m.tlsConfig, targetUnixFile)
+		proxy := NewTargetProxy(zeroAddress, 0, serverTLSConfig, clientTLSConfig, targetUnixFile, key)
 
-		err := proxy.StartListening()
+		err := proxy.Start()
 		if err != nil {
-			proxy.StopListening()
+			proxy.Stop()
 			// close all already created proxies for this key
 			for _, curProxy := range proxiesList {
-				curProxy.StopListening()
+				curProxy.Stop()
 			}
 			return err
 		}
 		proxiesList = append(proxiesList, proxy)
-		log.Log.Infof("Proxy Target listening on port %d for key %s", proxy.tcpBindPort, key)
+		proxy.logger.Infof("Manager created proxy on target")
 	}
 	m.targetProxies[key] = proxiesList
 	return nil
@@ -168,7 +217,7 @@ func ConstructProxyKey(id string, port int) string {
 	return key
 }
 
-func (m *migrationProxyManager) GetTargetListenerPorts(key string) map[int]int {
+func (m *migrationProxyManager) GetTargetListenerPorts(key string) map[string]int {
 	m.managerLock.Lock()
 	defer m.managerLock.Unlock()
 
@@ -183,11 +232,12 @@ func (m *migrationProxyManager) GetTargetListenerPorts(key string) map[int]int {
 	}
 
 	curProxies, exists := m.targetProxies[key]
-	targetSrcPortMap := make(map[int]int)
+	targetSrcPortMap := make(map[string]int)
 
 	if exists {
 		for _, curProxy := range curProxies {
-			targetSrcPortMap[curProxy.tcpBindPort] = getPortFromSocket(key, curProxy.targetAddress)
+			port := strconv.Itoa(curProxy.tcpBindPort)
+			targetSrcPortMap[port] = getPortFromSocket(key, curProxy.targetAddress)
 		}
 	}
 	return targetSrcPortMap
@@ -200,24 +250,28 @@ func (m *migrationProxyManager) StopTargetListener(key string) {
 	curProxies, exists := m.targetProxies[key]
 	if exists {
 		for _, curProxy := range curProxies {
-			curProxy.StopListening()
+			curProxy.logger.Info("Manager stopping proxy on target node")
+			curProxy.Stop()
 			delete(m.targetProxies, key)
-			log.Log.Infof("Stopping proxy target %s listening on %d", key, curProxy.tcpBindPort)
 		}
 	}
 }
 
-func (m *migrationProxyManager) StartSourceListener(key string, targetAddress string, destSrcPortMap map[int]int) error {
+func (m *migrationProxyManager) StartSourceListener(key string, targetAddress string, destSrcPortMap map[string]int, baseDir string) error {
 	m.managerLock.Lock()
 	defer m.managerLock.Unlock()
 
-	isExistingProxy := func(curProxies []*migrationProxy, targetAddress string, destSrcPortMap map[int]int) bool {
+	if m.isShuttingDown {
+		return fmt.Errorf("unable to process new migration connections during virt-handler shutdown")
+	}
+
+	isExistingProxy := func(curProxies []*migrationProxy, targetAddress string, destSrcPortMap map[string]int) bool {
 		if len(curProxies) != len(destSrcPortMap) {
 			return false
 		}
 		destSrcLookup := make(map[string]int)
 		for dest, src := range destSrcPortMap {
-			addr := fmt.Sprintf("%s:%d", targetAddress, dest)
+			addr := net.JoinHostPort(targetAddress, dest)
 			destSrcLookup[addr] = src
 		}
 		for _, curProxy := range curProxies {
@@ -237,31 +291,38 @@ func (m *migrationProxyManager) StartSourceListener(key string, targetAddress st
 		} else {
 			// stop the current proxy and point it somewhere new.
 			for _, curProxy := range curProxies {
-				curProxy.StopListening()
+				curProxy.logger.Infof("Manager is stopping proxy on source node due to new target location")
+				curProxy.Stop()
 			}
 		}
 	}
-
+	serverTLSConfig := m.serverTLSConfig
+	clientTLSConfig := m.clientTLSConfig
+	if m.config.GetMigrationConfiguration().DisableTLS != nil && *m.config.GetMigrationConfiguration().DisableTLS {
+		serverTLSConfig = nil
+		clientTLSConfig = nil
+	}
 	proxiesList := []*migrationProxy{}
 	for destPort, srcPort := range destSrcPortMap {
 		proxyKey := ConstructProxyKey(key, srcPort)
-		targetFullAddr := fmt.Sprintf("%s:%d", targetAddress, destPort)
-		filePath := SourceUnixFile(m.virtShareDir, proxyKey)
+		targetFullAddr := net.JoinHostPort(targetAddress, destPort)
+		filePath := SourceUnixFile(baseDir, proxyKey)
 
 		os.RemoveAll(filePath)
-		proxy := NewSourceProxy(filePath, targetFullAddr, m.tlsConfig)
 
-		err := proxy.StartListening()
+		proxy := NewSourceProxy(filePath, targetFullAddr, serverTLSConfig, clientTLSConfig, key)
+
+		err := proxy.Start()
 		if err != nil {
-			proxy.StopListening()
+			proxy.Stop()
 			// close all already created proxies for this key
 			for _, curProxy := range proxiesList {
-				curProxy.StopListening()
+				curProxy.Stop()
 			}
 			return err
 		}
 		proxiesList = append(proxiesList, proxy)
-		log.Log.Infof("Proxy Source listening on unix file %s for key %s", filePath, key)
+		proxy.logger.Infof("Manager created proxy on source node")
 	}
 	m.sourceProxies[key] = proxiesList
 	return nil
@@ -274,42 +335,44 @@ func (m *migrationProxyManager) StopSourceListener(key string) {
 	curProxies, exists := m.sourceProxies[key]
 	if exists {
 		for _, curProxy := range curProxies {
-			curProxy.StopListening()
+			curProxy.logger.Infof("Manager stopping proxy on source node")
+			curProxy.Stop()
 			os.RemoveAll(curProxy.unixSocketPath)
 		}
 		delete(m.sourceProxies, key)
 	}
-	filePath := SourceUnixFile(m.virtShareDir, key)
-	os.RemoveAll(filePath)
 }
 
-// SRC POD ENV(migration unix socket) <-> HOST ENV (tcp client) <-----> HOST ENV (tcp server) <-> TARGET POD ENV (libvirtd unix socket)
+// SRC POD ENV(migration unix socket) <-> HOST ENV (tcp client) <-----> HOST ENV (tcp server) <-> TARGET POD ENV (virtqemud unix socket)
 
 // Source proxy exposes a unix socket server and pipes to an outbound TCP connection.
-func NewSourceProxy(unixSocketPath string, tcpTargetAddress string, tlsConfig *tls.Config) *migrationProxy {
+func NewSourceProxy(unixSocketPath string, tcpTargetAddress string, serverTLSConfig *tls.Config, clientTLSConfig *tls.Config, vmiUID string) *migrationProxy {
 	return &migrationProxy{
-		unixSocketPath: unixSocketPath,
-		targetAddress:  tcpTargetAddress,
-		targetProtocol: "tcp",
-		stopChan:       make(chan struct{}),
-		fdChan:         make(chan net.Conn, 1),
-		listenErrChan:  make(chan error, 1),
-		tlsConfig:      tlsConfig,
+		unixSocketPath:  unixSocketPath,
+		targetAddress:   tcpTargetAddress,
+		targetProtocol:  "tcp",
+		stopChan:        make(chan struct{}),
+		fdChan:          make(chan net.Conn, 1),
+		listenErrChan:   make(chan error, 1),
+		serverTLSConfig: serverTLSConfig,
+		clientTLSConfig: clientTLSConfig,
+		logger:          log.Log.With("uid", vmiUID).With("listening", filepath.Base(unixSocketPath)).With("outbound", tcpTargetAddress),
 	}
 }
 
-// Target proxy listens on a tcp socket and pipes to a libvirtd unix socket
-func NewTargetProxy(tcpBindAddress string, tcpBindPort int, tlsConfig *tls.Config, libvirtdSocketPath string) *migrationProxy {
-
+// Target proxy listens on a tcp socket and pipes to a virtqemud unix socket
+func NewTargetProxy(tcpBindAddress string, tcpBindPort int, serverTLSConfig *tls.Config, clientTLSConfig *tls.Config, virtqemudSocketPath string, vmiUID string) *migrationProxy {
 	return &migrationProxy{
-		tcpBindAddress: tcpBindAddress,
-		tcpBindPort:    tcpBindPort,
-		targetAddress:  libvirtdSocketPath,
-		targetProtocol: "unix",
-		stopChan:       make(chan struct{}),
-		fdChan:         make(chan net.Conn, 1),
-		listenErrChan:  make(chan error, 1),
-		tlsConfig:      tlsConfig,
+		tcpBindAddress:  tcpBindAddress,
+		tcpBindPort:     tcpBindPort,
+		targetAddress:   virtqemudSocketPath,
+		targetProtocol:  "unix",
+		stopChan:        make(chan struct{}),
+		fdChan:          make(chan net.Conn, 1),
+		listenErrChan:   make(chan error, 1),
+		serverTLSConfig: serverTLSConfig,
+		clientTLSConfig: clientTLSConfig,
+		logger:          log.Log.With("uid", vmiUID).With("outbound", filepath.Base(virtqemudSocketPath)),
 	}
 
 }
@@ -317,21 +380,23 @@ func NewTargetProxy(tcpBindAddress string, tcpBindPort int, tlsConfig *tls.Confi
 func (m *migrationProxy) createTcpListener() error {
 	var listener net.Listener
 	var err error
-	if m.tlsConfig != nil {
-		listener, err = tls.Listen("tcp", fmt.Sprintf("%s:%d", m.tcpBindAddress, m.tcpBindPort), m.tlsConfig)
-	} else if strings.Contains(m.tcpBindAddress, "127.0.0.1") {
-		listener, err = net.Listen("tcp", fmt.Sprintf("%s:%d", m.tcpBindAddress, m.tcpBindPort))
+
+	laddr := net.JoinHostPort(m.tcpBindAddress, strconv.Itoa(m.tcpBindPort))
+	if m.serverTLSConfig != nil {
+		listener, err = tls.Listen("tcp", laddr, m.serverTLSConfig)
 	} else {
-		return fmt.Errorf("Unsecured tcp migration proxy listeners are not permitted")
+		listener, err = net.Listen("tcp", laddr)
 	}
 	if err != nil {
-		log.Log.Reason(err).Error("failed to create unix socket for proxy service")
+		m.logger.Reason(err).Error("failed to create unix socket for proxy service")
 		return err
 	}
 
 	if m.tcpBindPort == 0 {
 		// update the random port that was selected
 		m.tcpBindPort = listener.Addr().(*net.TCPAddr).Port
+		// Add the listener to the log output once we know the port
+		m.logger = m.logger.With("listening", fmt.Sprintf("%s:%d", m.tcpBindAddress, m.tcpBindPort))
 	}
 
 	m.listener = listener
@@ -341,15 +406,19 @@ func (m *migrationProxy) createTcpListener() error {
 func (m *migrationProxy) createUnixListener() error {
 
 	os.RemoveAll(m.unixSocketPath)
-	err := os.MkdirAll(filepath.Dir(m.unixSocketPath), 0755)
+	err := util.MkdirAllWithNosec(filepath.Dir(m.unixSocketPath))
 	if err != nil {
-		log.Log.Reason(err).Error("unable to create directory for unix socket")
+		m.logger.Reason(err).Error("unable to create directory for unix socket")
 		return err
 	}
 
 	listener, err := net.Listen("unix", m.unixSocketPath)
 	if err != nil {
-		log.Log.Reason(err).Error("failed to create unix socket for proxy service")
+		m.logger.Reason(err).Error("failed to create unix socket for proxy service")
+		return err
+	}
+	if err := diskutils.DefaultOwnershipManager.UnsafeSetFileOwnership(m.unixSocketPath); err != nil {
+		log.Log.Reason(err).Error("failed to change ownership on migration unix socket")
 		return err
 	}
 
@@ -358,61 +427,61 @@ func (m *migrationProxy) createUnixListener() error {
 
 }
 
-func (m *migrationProxy) StopListening() {
+func (m *migrationProxy) Stop() {
 
 	close(m.stopChan)
 	if m.listener != nil {
+		m.logger.Infof("proxy stopped listening")
 		m.listener.Close()
 	}
 }
 
-func handleConnection(fd net.Conn, targetAddress string, targetProtocol string, tlsConfig *tls.Config, stopChan chan struct{}) {
+func (m *migrationProxy) handleConnection(fd net.Conn) {
 	defer fd.Close()
 
-	outBoundErr := make(chan error)
-	inBoundErr := make(chan error)
+	outBoundErr := make(chan error, 1)
+	inBoundErr := make(chan error, 1)
 
 	var conn net.Conn
 	var err error
-	if targetProtocol == "tcp" && tlsConfig != nil {
-		conn, err = tls.Dial(targetProtocol, targetAddress, tlsConfig)
+	if m.targetProtocol == "tcp" && m.clientTLSConfig != nil {
+		conn, err = tls.Dial(m.targetProtocol, m.targetAddress, m.clientTLSConfig)
 	} else {
-		conn, err = net.Dial(targetProtocol, targetAddress)
+		conn, err = net.Dial(m.targetProtocol, m.targetAddress)
 	}
 	if err != nil {
-		log.Log.Reason(err).Errorf("unable to create outbound leg of proxy to host %s", targetAddress)
+		m.logger.Reason(err).Error("unable to create outbound leg of proxy to host")
 		return
 	}
 
 	go func() {
 		//from outbound connection to proxy
 		n, err := io.Copy(fd, conn)
-		log.Log.Infof("%d bytes read from oubound connection", n)
+		m.logger.Infof("%d bytes copied outbound to inbound", n)
 		inBoundErr <- err
 	}()
 	go func() {
 		//from proxy to outbound connection
-
 		n, err := io.Copy(conn, fd)
-		log.Log.Infof("%d bytes written oubound connection", n)
+		m.logger.Infof("%d bytes copied from inbound to outbound", n)
 		outBoundErr <- err
 	}()
 
 	select {
 	case err = <-outBoundErr:
 		if err != nil {
-			log.Log.Reason(err).Errorf("error encountered copying data to outbound proxy connection %s", targetAddress)
+			m.logger.Reason(err).Errorf("error encountered copying data to outbound connection")
 		}
 	case err = <-inBoundErr:
 		if err != nil {
-			log.Log.Reason(err).Errorf("error encountered reading data to proxy connection %s", targetAddress)
+			m.logger.Reason(err).Errorf("error encountered copying data into inbound connection")
 		}
-	case <-stopChan:
-		log.Log.Infof("stop channel terminated proxy")
+	case <-m.stopChan:
+		m.logger.Info("stop channel terminated proxy")
 	}
 }
 
-func (m *migrationProxy) StartListening() error {
+func (m *migrationProxy) Start() error {
 
 	if m.unixSocketPath != "" {
 		err := m.createUnixListener()
@@ -426,32 +495,40 @@ func (m *migrationProxy) StartListening() error {
 		}
 	}
 
-	go func(ln net.Listener, fdChan chan net.Conn, listenErr chan error) {
+	go func(ln net.Listener, fdChan chan net.Conn, listenErr chan error, stopChan chan struct{}) {
 		for {
 			fd, err := ln.Accept()
 			if err != nil {
 				listenErr <- err
-				log.Log.Reason(err).Error("proxy unix socket listener returned error.")
+
+				select {
+				case <-stopChan:
+					// If the stopChan is closed, then this is expected. Log at a lesser debug level
+					m.logger.Reason(err).V(3).Infof("stopChan is closed. Listener exited with expected error.")
+				default:
+					m.logger.Reason(err).Error("proxy unix socket listener returned error.")
+				}
 				break
 			} else {
 				fdChan <- fd
 			}
 		}
-	}(m.listener, m.fdChan, m.listenErrChan)
+	}(m.listener, m.fdChan, m.listenErrChan, m.stopChan)
 
-	go func(targetAddress string, targetProtocol string, tlsConfig *tls.Config, fdChan chan net.Conn, stopChan chan struct{}, listenErrChan chan error) {
+	go func(m *migrationProxy) {
 		for {
 			select {
-			case fd := <-fdChan:
-				go handleConnection(fd, targetAddress, targetProtocol, tlsConfig, stopChan)
-			case <-stopChan:
+			case fd := <-m.fdChan:
+				go m.handleConnection(fd)
+			case <-m.stopChan:
 				return
-			case <-listenErrChan:
+			case <-m.listenErrChan:
 				return
 			}
 		}
 
-	}(m.targetAddress, m.targetProtocol, m.tlsConfig, m.fdChan, m.stopChan, m.listenErrChan)
+	}(m)
 
+	m.logger.Infof("proxy started listening")
 	return nil
 }

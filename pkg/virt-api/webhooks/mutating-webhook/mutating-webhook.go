@@ -23,28 +23,37 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"k8s.io/api/admission/v1beta1"
+	admissionv1 "k8s.io/api/admission/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 
-	"kubevirt.io/kubevirt/pkg/log"
+	"kubevirt.io/client-go/kubecli"
+	"kubevirt.io/client-go/log"
+
+	"kubevirt.io/kubevirt/pkg/instancetype"
+	webhookutils "kubevirt.io/kubevirt/pkg/util/webhooks"
 	"kubevirt.io/kubevirt/pkg/virt-api/webhooks"
 	"kubevirt.io/kubevirt/pkg/virt-api/webhooks/mutating-webhook/mutators"
 	virtconfig "kubevirt.io/kubevirt/pkg/virt-config"
 )
 
 type mutator interface {
-	Mutate(*v1beta1.AdmissionReview) *v1beta1.AdmissionResponse
+	Mutate(*admissionv1.AdmissionReview) *admissionv1.AdmissionResponse
 }
 
 func serve(resp http.ResponseWriter, req *http.Request, m mutator) {
-	response := v1beta1.AdmissionReview{}
-	review, err := webhooks.GetAdmissionReview(req)
-
+	review, err := webhookutils.GetAdmissionReview(req)
 	if err != nil {
 		resp.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
+	response := admissionv1.AdmissionReview{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: admissionv1.SchemeGroupVersion.String(),
+			Kind:       "AdmissionReview",
+		},
+	}
 	reviewResponse := m.Mutate(review)
 	if reviewResponse != nil {
 		response.Response = reviewResponse
@@ -65,13 +74,20 @@ func serve(resp http.ResponseWriter, req *http.Request, m mutator) {
 		resp.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	resp.WriteHeader(http.StatusOK)
 }
 
-func ServeVMIs(resp http.ResponseWriter, req *http.Request, clusterConfig *virtconfig.ClusterConfig) {
-	serve(resp, req, &mutators.VMIsMutator{ClusterConfig: clusterConfig})
+func ServeVMs(resp http.ResponseWriter, req *http.Request, clusterConfig *virtconfig.ClusterConfig, virtCli kubecli.KubevirtClient) {
+	serve(resp, req, &mutators.VMsMutator{ClusterConfig: clusterConfig, InstancetypeMethods: &instancetype.InstancetypeMethods{Clientset: virtCli}})
+}
+
+func ServeVMIs(resp http.ResponseWriter, req *http.Request, clusterConfig *virtconfig.ClusterConfig, informers *webhooks.Informers, kubeVirtServiceAccounts map[string]struct{}) {
+	serve(resp, req, &mutators.VMIsMutator{ClusterConfig: clusterConfig, VMIPresetInformer: informers.VMIPresetInformer, KubeVirtServiceAccounts: kubeVirtServiceAccounts})
 }
 
 func ServeMigrationCreate(resp http.ResponseWriter, req *http.Request) {
 	serve(resp, req, &mutators.MigrationCreateMutator{})
+}
+
+func ServeClones(resp http.ResponseWriter, req *http.Request) {
+	serve(resp, req, mutators.NewCloneCreateMutator())
 }

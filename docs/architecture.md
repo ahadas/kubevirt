@@ -59,16 +59,19 @@ Once all three steps have been completed, you are able to
   `kubelet` - to launch the VMI and configure it until it matches the required
   state.
 
-One a final note it is to say that both, the controllers and daemons are running
-as Pods (or similar) _on top of_ the Kubernetes cluster, and are not installed
-alongside it. The type is - as said before - even defined inside the
-Kubernetes API server. This allows users to speak to Kubernetes, but modify VMIs.
+One final note; both controllers and daemons are running as Pods (or similar)
+_on top of_ the Kubernetes cluster, and are not installed alongside it. The type
+is - as said before - even defined inside the Kubernetes API server. This allows
+users to speak to Kubernetes, but modify VMIs.
 
 The following diagram illustrates how the additional controllers and daemons
 communicate with Kubernetes and where the additional types are stored:
 
 ![Architecture diagram](architecture.png "Architecture")
 
+And a simplified version:
+
+![Simplified architecture diagram](architecture-simple.png "Simplified architecture")
 
 ## Application Layout
 
@@ -82,6 +85,17 @@ communicate with Kubernetes and where the additional types are stored:
     * VMI Foo
     * VMI Bar
     * …
+  * KubeVirt Custom Resources
+    * VirtualMachine (VM) Foo
+        -> VirtualMachineInstance (VMI) Foo
+    * VirtualMachineInstanceReplicaSet (VMIRS) Bar
+        -> VirtualMachineInstance (VMI) Bar
+
+VirtualMachineInstance (VMI) is the custom resource that represents the basic ephemeral building block of an instance.
+In a lot of cases this object won't be created directly by the user but by a high level resource.
+High level resources for VMI can be:
+* VirtualMachine (VM) - StateFul VM that can be stopped and started while keeping the VM data and state.
+* VirtualMachineInstanceReplicaSet (VMIRS) - Similar to pods ReplicaSet, a group of ephemeral VMIs with similar configuration defined in a template.
 
 ## Native Workloads
 
@@ -114,5 +128,5 @@ To decide these dilemmas we came up with the **KubeVirt Razor**:
 For example, we debated how we should connect VMs to external network
 resources. The quickest way seems to introduce KubeVirt-specific code,
 attaching a VM to a host bridge.
-However, we chose the longer path, of integrating with [Multus](https://github.com/intel/multus-cni)
+However, we chose the longer path of integrating with [Multus](https://github.com/intel/multus-cni)
 and [CNI](https://github.com/containernetworking) and improving them.

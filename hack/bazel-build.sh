@@ -20,38 +20,78 @@
 set -e
 
 source hack/common.sh
+source hack/bootstrap.sh
 source hack/config.sh
 
 rm -rf ${CMD_OUT_DIR}
 mkdir -p ${CMD_OUT_DIR}/virtctl
+mkdir -p ${CMD_OUT_DIR}/dump
+mkdir -p ${CMD_OUT_DIR}/perfscale-audit
+mkdir -p ${CMD_OUT_DIR}/perfscale-load-generator
+mkdir -p ${CMD_OUT_DIR}/cluster-profiler
+mkdir -p ${CMD_OUT_DIR}/cniplugins
 
 # Build all binaries for amd64
 bazel build \
-    --platforms=@io_bazel_rules_go//go/toolchain:linux_amd64 \
-    --workspace_status_command=./hack/print-workspace-status.sh \
-    //cmd/...
+    --config=${ARCHITECTURE} \
+    //tools/csv-generator/... \
+    //tools/perfscale-audit/... \
+    //tools/perfscale-load-generator/... \
+    //tools/cluster-profiler/... \
+    //cmd/... \
+    //staging/src/kubevirt.io/client-go/examples/...
+
+# Copy dump binary to a reachable place outside of the build container
+bazel run \
+    --config=${ARCHITECTURE} \
+    :build-dump -- ${CMD_OUT_DIR}/dump/dump
+
+# Copy perfscale-audit binary to a reachable place outside of the build container
+bazel run \
+    --config=${ARCHITECTURE} \
+    :build-perfscale-audit -- ${CMD_OUT_DIR}/perfscale-audit/perfscale-audit
+
+# Copy perfscale-load-generator binary to a reachable place outside of the build container
+bazel run \
+    --config=${ARCHITECTURE} \
+    :build-perfscale-load-generator -- ${CMD_OUT_DIR}/perfscale-load-generator/perfscale-load-generator
+
+# Copy cluster-profiler binary to a reachable place outside of the build container
+bazel run \
+    --config=${ARCHITECTURE} \
+    :build-cluster-profiler -- ${CMD_OUT_DIR}/cluster-profiler/cluster-profiler
 
 # build platform native virtctl explicitly
 bazel run \
-    --workspace_status_command=./hack/print-workspace-status.sh \
+    --config="$(uname -m)" \
     :build-virtctl -- ${CMD_OUT_DIR}/virtctl/virtctl
 
-# cross-compile virtctl for
-
-# linux
+# Copy kubevirt-passt-binding binary to a reachable place outside of the build container
 bazel run \
-    --platforms=@io_bazel_rules_go//go/toolchain:linux_amd64 \
-    --workspace_status_command=./hack/print-workspace-status.sh \
-    :build-virtctl -- ${CMD_OUT_DIR}/virtctl/virtctl-${KUBEVIRT_VERSION}-linux-amd64
+    --config=${ARCHITECTURE} \
+    :build-cni-passt-binding -- ${CMD_OUT_DIR}/cniplugins/kubevirt-passt-binding
 
-# darwin
-bazel run \
-    --platforms=@io_bazel_rules_go//go/toolchain:darwin_amd64 \
-    --workspace_status_command=./hack/print-workspace-status.sh \
-    :build-virtctl -- ${CMD_OUT_DIR}/virtctl/virtctl-${KUBEVIRT_VERSION}-darwin-amd64
+# compile virtctl for amd64 and arm64
 
-# windows
-bazel run \
-    --platforms=@io_bazel_rules_go//go/toolchain:windows_amd64 \
-    --workspace_status_command=./hack/print-workspace-status.sh \
-    :build-virtctl -- ${CMD_OUT_DIR}/virtctl/virtctl-${KUBEVIRT_VERSION}-windows-amd64.exe
+if [[ "${KUBEVIRT_RELEASE}" == "true" || "${CI}" == "true" ]]; then
+    # linux
+    bazel run \
+        :build-virtctl-amd64 -- ${CMD_OUT_DIR}/virtctl/virtctl-${KUBEVIRT_VERSION}-linux-amd64
+
+    bazel run \
+        :build-virtctl-arm64 -- ${CMD_OUT_DIR}/virtctl/virtctl-${KUBEVIRT_VERSION}-linux-arm64
+
+    bazel run \
+        :build-virtctl-s390x -- ${CMD_OUT_DIR}/virtctl/virtctl-${KUBEVIRT_VERSION}-linux-s390x
+
+    # darwin
+    bazel run \
+        :build-virtctl-darwin -- ${CMD_OUT_DIR}/virtctl/virtctl-${KUBEVIRT_VERSION}-darwin-amd64
+
+    bazel run \
+        :build-virtctl-darwin-arm64 -- ${CMD_OUT_DIR}/virtctl/virtctl-${KUBEVIRT_VERSION}-darwin-arm64
+
+    # windows
+    bazel run \
+        :build-virtctl-windows -- ${CMD_OUT_DIR}/virtctl/virtctl-${KUBEVIRT_VERSION}-windows-amd64.exe
+fi

@@ -21,13 +21,25 @@ package virt_operator
 
 import (
 	"context"
-	"io/ioutil"
+	"crypto/tls"
+	"fmt"
 	golog "log"
 	"net/http"
 	"os"
 
+	kvtls "kubevirt.io/kubevirt/pkg/util/tls"
+
+	"github.com/emicklei/go-restful/v3"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/pflag"
+	"k8s.io/client-go/util/certificate"
+	aggregatorclient "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset"
+
+	"kubevirt.io/kubevirt/pkg/certificates/bootstrap"
+
+	validating_webhooks "kubevirt.io/kubevirt/pkg/util/webhooks/validating-webhooks"
+	"kubevirt.io/kubevirt/pkg/virt-operator/resource/generate/components"
+	operator_webhooks "kubevirt.io/kubevirt/pkg/virt-operator/webhooks"
 
 	k8sv1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -38,16 +50,23 @@ import (
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"k8s.io/client-go/tools/record"
 
-	"kubevirt.io/kubevirt/pkg/certificates"
+	"kubevirt.io/client-go/kubecli"
+	"kubevirt.io/client-go/log"
+	clientutil "kubevirt.io/client-go/util"
+
 	"kubevirt.io/kubevirt/pkg/controller"
-	"kubevirt.io/kubevirt/pkg/kubecli"
-	"kubevirt.io/kubevirt/pkg/log"
+	clientmetrics "kubevirt.io/kubevirt/pkg/monitoring/metrics/common/client"
+	metrics "kubevirt.io/kubevirt/pkg/monitoring/metrics/virt-operator"
+	"kubevirt.io/kubevirt/pkg/monitoring/profiler"
 	"kubevirt.io/kubevirt/pkg/service"
-	kvutil "kubevirt.io/kubevirt/pkg/util"
+	clusterutil "kubevirt.io/kubevirt/pkg/util/cluster"
+	virtconfig "kubevirt.io/kubevirt/pkg/virt-config"
 	"kubevirt.io/kubevirt/pkg/virt-controller/leaderelectionconfig"
-	installstrategy "kubevirt.io/kubevirt/pkg/virt-operator/install-strategy"
+	install "kubevirt.io/kubevirt/pkg/virt-operator/resource/generate/install"
 	"kubevirt.io/kubevirt/pkg/virt-operator/util"
 )
+
+const VirtOperator = "virt-operator"
 
 const (
 	controllerThreads = 3
@@ -66,7 +85,7 @@ type VirtOperatorApp struct {
 	restClient      *clientrest.RESTClient
 	informerFactory controller.KubeInformerFactory
 
-	kubeVirtController KubeVirtController
+	kubeVirtController *KubeVirtController
 	kubeVirtRecorder   record.EventRecorder
 
 	operatorNamespace string
@@ -74,13 +93,22 @@ type VirtOperatorApp struct {
 	kubeVirtInformer cache.SharedIndexInformer
 	kubeVirtCache    cache.Store
 
+	crdInformer cache.SharedIndexInformer
+
 	stores    util.Stores
 	informers util.Informers
 
-	LeaderElection leaderelectionconfig.Configuration
-}
+	LeaderElection      leaderelectionconfig.Configuration
+	aggregatorClient    aggregatorclient.Interface
+	operatorCertManager certificate.Manager
 
-var _ service.Service = &VirtOperatorApp{}
+	clusterConfig *virtconfig.ClusterConfig
+	host          string
+
+	ctx context.Context
+
+	reInitChan chan string
+}
 
 func Execute() {
 	var err error
@@ -90,7 +118,35 @@ func Execute() {
 
 	service.Setup(&app)
 
-	log.InitializeLogging("virt-operator")
+	log.InitializeLogging(VirtOperator)
+
+	if err := metrics.SetupMetrics(); err != nil {
+		golog.Fatalf("Error setting up metrics: %v", err)
+	}
+
+	host, err := os.Hostname()
+	if err != nil {
+		golog.Fatalf("unable to get hostname: %v", err)
+	}
+	app.host = host
+
+	err = util.VerifyEnv()
+	if err != nil {
+		golog.Fatal(err)
+	}
+
+	// apply any passthrough environment to this operator as well
+	for k, v := range util.GetPassthroughEnv() {
+		os.Setenv(k, v)
+	}
+
+	clientmetrics.RegisterRestConfigHooks()
+	config, err := kubecli.GetKubevirtClientConfig()
+	if err != nil {
+		panic(err)
+	}
+
+	app.aggregatorClient = aggregatorclient.NewForConfigOrDie(config)
 
 	app.clientSet, err = kubecli.GetKubevirtClient()
 
@@ -102,20 +158,20 @@ func Execute() {
 
 	app.LeaderElection = leaderelectionconfig.DefaultLeaderElectionConfiguration()
 
-	app.operatorNamespace, err = kvutil.GetNamespace()
+	app.operatorNamespace, err = clientutil.GetNamespace()
 	if err != nil {
 		golog.Fatalf("Error searching for namespace: %v", err)
 	}
 
 	if *dumpInstallStrategy {
-		err = installstrategy.DumpInstallStrategyToConfigMap(app.clientSet)
+		err = install.DumpInstallStrategyToConfigMap(app.clientSet, app.operatorNamespace)
 		if err != nil {
 			golog.Fatal(err)
 		}
 		os.Exit(0)
 	}
 
-	app.informerFactory = controller.NewKubeInformerFactory(app.restClient, app.clientSet, app.operatorNamespace)
+	app.informerFactory = controller.NewKubeInformerFactory(app.restClient, app.clientSet, app.aggregatorClient, app.operatorNamespace)
 
 	app.kubeVirtInformer = app.informerFactory.KubeVirt()
 	app.kubeVirtCache = app.kubeVirtInformer.GetStore()
@@ -131,9 +187,17 @@ func Execute() {
 		Deployment:               app.informerFactory.OperatorDeployment(),
 		DaemonSet:                app.informerFactory.OperatorDaemonSet(),
 		ValidationWebhook:        app.informerFactory.OperatorValidationWebhook(),
+		MutatingWebhook:          app.informerFactory.OperatorMutatingWebhook(),
+		APIService:               app.informerFactory.OperatorAPIService(),
 		InstallStrategyConfigMap: app.informerFactory.OperatorInstallStrategyConfigMaps(),
 		InstallStrategyJob:       app.informerFactory.OperatorInstallStrategyJob(),
 		InfrastructurePod:        app.informerFactory.OperatorPod(),
+		PodDisruptionBudget:      app.informerFactory.OperatorPodDisruptionBudget(),
+		Namespace:                app.informerFactory.Namespace(),
+		Secrets:                  app.informerFactory.Secrets(),
+		ConfigMap:                app.informerFactory.OperatorConfigMap(),
+		ClusterInstancetype:      app.informerFactory.VirtualMachineClusterInstancetype(),
+		ClusterPreference:        app.informerFactory.VirtualMachineClusterPreference(),
 	}
 
 	app.stores = util.Stores{
@@ -147,12 +211,22 @@ func Execute() {
 		DeploymentCache:               app.informerFactory.OperatorDeployment().GetStore(),
 		DaemonSetCache:                app.informerFactory.OperatorDaemonSet().GetStore(),
 		ValidationWebhookCache:        app.informerFactory.OperatorValidationWebhook().GetStore(),
+		MutatingWebhookCache:          app.informerFactory.OperatorMutatingWebhook().GetStore(),
+		APIServiceCache:               app.informerFactory.OperatorAPIService().GetStore(),
 		InstallStrategyConfigMapCache: app.informerFactory.OperatorInstallStrategyConfigMaps().GetStore(),
 		InstallStrategyJobCache:       app.informerFactory.OperatorInstallStrategyJob().GetStore(),
 		InfrastructurePodCache:        app.informerFactory.OperatorPod().GetStore(),
+		PodDisruptionBudgetCache:      app.informerFactory.OperatorPodDisruptionBudget().GetStore(),
+		NamespaceCache:                app.informerFactory.Namespace().GetStore(),
+		SecretCache:                   app.informerFactory.Secrets().GetStore(),
+		ConfigMapCache:                app.informerFactory.OperatorConfigMap().GetStore(),
+		ClusterInstancetype:           app.informerFactory.VirtualMachineClusterInstancetype().GetStore(),
+		ClusterPreference:             app.informerFactory.VirtualMachineClusterPreference().GetStore(),
 	}
 
-	onOpenShift, err := util.IsOnOpenshift(app.clientSet)
+	app.crdInformer = app.informerFactory.CRD()
+
+	onOpenShift, err := clusterutil.IsOnOpenShift(app.clientSet)
 	if err != nil {
 		golog.Fatalf("Error determining cluster type: %v", err)
 	}
@@ -160,55 +234,150 @@ func Execute() {
 		log.Log.Info("we are on openshift")
 		app.informers.SCC = app.informerFactory.OperatorSCC()
 		app.stores.SCCCache = app.informerFactory.OperatorSCC().GetStore()
+		app.informers.Route = app.informerFactory.OperatorRoute()
+		app.stores.RouteCache = app.informerFactory.OperatorRoute().GetStore()
+		app.stores.IsOnOpenshift = true
 	} else {
 		log.Log.Info("we are on kubernetes")
 		app.informers.SCC = app.informerFactory.DummyOperatorSCC()
 		app.stores.SCCCache = app.informerFactory.DummyOperatorSCC().GetStore()
+		app.informers.Route = app.informerFactory.DummyOperatorRoute()
+		app.stores.RouteCache = app.informerFactory.DummyOperatorRoute().GetStore()
 	}
 
-	app.kubeVirtRecorder = app.getNewRecorder(k8sv1.NamespaceAll, "virt-operator")
-	app.kubeVirtController = *NewKubeVirtController(app.clientSet, app.kubeVirtInformer, app.kubeVirtRecorder, app.stores, app.informers)
+	serviceMonitorEnabled, err := util.IsServiceMonitorEnabled(app.clientSet)
+	if err != nil {
+		golog.Fatalf("Error checking for ServiceMonitor: %v", err)
+	}
+	if serviceMonitorEnabled {
+		log.Log.Info("servicemonitor is defined")
+		app.informers.ServiceMonitor = app.informerFactory.OperatorServiceMonitor()
+		app.stores.ServiceMonitorCache = app.informerFactory.OperatorServiceMonitor().GetStore()
 
-	image := os.Getenv(util.OperatorImageEnvName)
+		app.stores.ServiceMonitorEnabled = true
+	} else {
+		log.Log.Info("servicemonitor is not defined")
+		app.informers.ServiceMonitor = app.informerFactory.DummyOperatorServiceMonitor()
+		app.stores.ServiceMonitorCache = app.informerFactory.DummyOperatorServiceMonitor().GetStore()
+	}
+
+	prometheusRuleEnabled, err := util.IsPrometheusRuleEnabled(app.clientSet)
+	if err != nil {
+		golog.Fatalf("Error checking for PrometheusRule: %v", err)
+	}
+	if prometheusRuleEnabled {
+		log.Log.Info("prometheusrule is defined")
+		app.informers.PrometheusRule = app.informerFactory.OperatorPrometheusRule()
+		app.stores.PrometheusRuleCache = app.informerFactory.OperatorPrometheusRule().GetStore()
+		app.stores.PrometheusRulesEnabled = true
+	} else {
+		log.Log.Info("prometheusrule is not defined")
+		app.informers.PrometheusRule = app.informerFactory.DummyOperatorPrometheusRule()
+		app.stores.PrometheusRuleCache = app.informerFactory.DummyOperatorPrometheusRule().GetStore()
+	}
+
+	validatingAdmissionPolicyBindingEnabled, err := util.IsValidatingAdmissionPolicyBindingEnabled(app.clientSet)
+	if err != nil {
+		golog.Fatalf("Error checking for ValidatingAdmissionPolicyBinding: %v", err)
+	}
+	if validatingAdmissionPolicyBindingEnabled {
+		log.Log.Info("validatingAdmissionPolicyBindingEnabled is defined")
+		app.informers.ValidatingAdmissionPolicyBinding = app.informerFactory.OperatorValidatingAdmissionPolicyBinding()
+		app.stores.ValidatingAdmissionPolicyBindingCache = app.informerFactory.OperatorValidatingAdmissionPolicyBinding().GetStore()
+		app.stores.ValidatingAdmissionPolicyBindingEnabled = true
+	} else {
+		log.Log.Info("validatingAdmissionPolicyBindingEnabled is not defined")
+		app.informers.ValidatingAdmissionPolicyBinding = app.informerFactory.DummyOperatorValidatingAdmissionPolicyBinding()
+		app.stores.ValidatingAdmissionPolicyBindingCache = app.informerFactory.DummyOperatorValidatingAdmissionPolicyBinding().GetStore()
+	}
+
+	validatingAdmissionPolicyEnabled, err := util.IsValidatingAdmissionPolicyEnabled(app.clientSet)
+	if err != nil {
+		golog.Fatalf("Error checking for ValidatingAdmissionPolicy: %v", err)
+	}
+	if validatingAdmissionPolicyEnabled {
+		log.Log.Info("validatingAdmissionPolicyEnabled is defined")
+		app.informers.ValidatingAdmissionPolicy = app.informerFactory.OperatorValidatingAdmissionPolicy()
+		app.stores.ValidatingAdmissionPolicyCache = app.informerFactory.OperatorValidatingAdmissionPolicy().GetStore()
+		app.stores.ValidatingAdmissionPolicyEnabled = true
+	} else {
+		log.Log.Info("validatingAdmissionPolicyEnabled is not defined")
+		app.informers.ValidatingAdmissionPolicy = app.informerFactory.DummyOperatorValidatingAdmissionPolicy()
+		app.stores.ValidatingAdmissionPolicyCache = app.informerFactory.DummyOperatorValidatingAdmissionPolicy().GetStore()
+	}
+
+	app.prepareCertManagers()
+
+	app.kubeVirtRecorder = app.getNewRecorder(k8sv1.NamespaceAll, VirtOperator)
+	app.kubeVirtController, err = NewKubeVirtController(app.clientSet, app.aggregatorClient.ApiregistrationV1().APIServices(), app.kubeVirtInformer, app.kubeVirtRecorder, app.stores, app.informers, app.operatorNamespace)
+	if err != nil {
+		panic(err)
+	}
+
+	image := util.GetOperatorImage()
 	if image == "" {
 		golog.Fatalf("Error getting operator's image: %v", err)
 	}
 	log.Log.Infof("Operator image: %s", image)
 
-	app.Run()
-}
+	app.clusterConfig, err = virtconfig.NewClusterConfig(
+		app.informerFactory.CRD(),
+		app.informerFactory.KubeVirt(),
+		app.operatorNamespace,
+	)
 
-func (app *VirtOperatorApp) Run() {
-
-	// prepare certs
-	certsDirectory, err := ioutil.TempDir("", "certsdir")
 	if err != nil {
 		panic(err)
 	}
-	defer os.RemoveAll(certsDirectory)
-
-	certStore, err := certificates.GenerateSelfSignedCert(certsDirectory, "virt-operator", app.operatorNamespace)
-	if err != nil {
-		log.Log.Reason(err).Error("unable to generate certificates")
-		panic(err)
-	}
-
-	go func() {
-		// serve metrics
-		http.Handle("/metrics", promhttp.Handler())
-		err = http.ListenAndServeTLS(app.ServiceListen.Address(), certStore.CurrentPath(), certStore.CurrentPath(), nil)
-		if err != nil {
-			log.Log.Reason(err).Error("Serving prometheus failed.")
-			panic(err)
-		}
-	}()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	app.ctx = ctx
 
-	endpointName := "virt-operator"
+	app.reInitChan = make(chan string, 0)
+	app.clusterConfig.SetConfigModifiedCallback(app.shouldChangeLogVerbosity)
+	app.clusterConfig.SetConfigModifiedCallback(app.shouldUpdateConfigurationMetrics)
 
-	recorder := app.getNewRecorder(k8sv1.NamespaceAll, endpointName)
+	go app.Run()
+	<-app.reInitChan
+}
+
+func (app *VirtOperatorApp) Run() {
+	promTLSConfig := kvtls.SetupPromTLS(app.operatorCertManager, app.clusterConfig)
+
+	go func() {
+
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+
+		webService := new(restful.WebService)
+		webService.Path("/").Consumes(restful.MIME_JSON).Produces(restful.MIME_JSON)
+
+		componentProfiler := profiler.NewProfileManager(app.clusterConfig)
+		webService.Route(webService.GET("/start-profiler").To(componentProfiler.HandleStartProfiler).Doc("start profiler endpoint"))
+		webService.Route(webService.GET("/stop-profiler").To(componentProfiler.HandleStopProfiler).Doc("stop profiler endpoint"))
+		webService.Route(webService.GET("/dump-profiler").To(componentProfiler.HandleDumpProfiler).Doc("dump profiler results endpoint"))
+
+		restfulContainer := restful.NewContainer()
+		restfulContainer.ServeMux = mux
+		restfulContainer.Add(webService)
+
+		server := http.Server{
+			Addr:      app.ServiceListen.Address(),
+			Handler:   mux,
+			TLSConfig: promTLSConfig,
+			// Disable HTTP/2
+			// See CVE-2023-44487
+			TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){},
+		}
+		if err := server.ListenAndServeTLS("", ""); err != nil {
+			golog.Fatal(err)
+		}
+	}()
+
+	leaseName := VirtOperator
+
+	recorder := app.getNewRecorder(k8sv1.NamespaceAll, leaseName)
 
 	id, err := os.Hostname()
 	if err != nil {
@@ -217,8 +386,9 @@ func (app *VirtOperatorApp) Run() {
 
 	rl, err := resourcelock.New(app.LeaderElection.ResourceLock,
 		app.operatorNamespace,
-		endpointName,
+		leaseName,
 		app.clientSet.CoreV1(),
+		app.clientSet.CoordinationV1(),
 		resourcelock.ResourceLockConfig{
 			Identity:      id,
 			EventRecorder: recorder,
@@ -226,6 +396,46 @@ func (app *VirtOperatorApp) Run() {
 	if err != nil {
 		golog.Fatal(err)
 	}
+
+	apiAuthConfig := app.informerFactory.ApiAuthConfigMap()
+
+	stop := app.ctx.Done()
+	app.informerFactory.Start(stop)
+
+	stopChan := app.ctx.Done()
+	cache.WaitForCacheSync(stopChan, app.crdInformer.HasSynced, app.kubeVirtInformer.HasSynced)
+	app.clusterConfig.SetConfigModifiedCallback(app.configModificationCallback)
+
+	cache.WaitForCacheSync(stop, apiAuthConfig.HasSynced)
+
+	go app.operatorCertManager.Start()
+
+	caManager := kvtls.NewKubernetesClientCAManager(apiAuthConfig.GetStore())
+
+	tlsConfig := kvtls.SetupTLSWithCertManager(caManager, app.operatorCertManager, tls.VerifyClientCertIfGiven, app.clusterConfig)
+
+	webhookServer := &http.Server{
+		Addr:      fmt.Sprintf("%s:%d", app.BindAddress, 8444),
+		TLSConfig: tlsConfig,
+	}
+
+	var mux http.ServeMux
+	mux.HandleFunc("/kubevirt-validate-delete", func(w http.ResponseWriter, r *http.Request) {
+		validating_webhooks.Serve(w, r, operator_webhooks.NewKubeVirtDeletionAdmitter(app.clientSet))
+	})
+	mux.HandleFunc(components.KubeVirtUpdateValidatePath, func(w http.ResponseWriter, r *http.Request) {
+		validating_webhooks.Serve(w, r, operator_webhooks.NewKubeVirtUpdateAdmitter(app.clientSet, app.clusterConfig))
+	})
+	mux.HandleFunc(components.KubeVirtCreateValidatePath, func(w http.ResponseWriter, r *http.Request) {
+		validating_webhooks.Serve(w, r, operator_webhooks.NewKubeVirtCreateAdmitter(app.clientSet))
+	})
+	webhookServer.Handler = &mux
+	go func() {
+		err := webhookServer.ListenAndServeTLS("", "")
+		if err != nil {
+			panic(err)
+		}
+	}()
 
 	leaderElector, err := leaderelection.NewLeaderElector(
 		leaderelection.LeaderElectionConfig{
@@ -235,13 +445,18 @@ func (app *VirtOperatorApp) Run() {
 			RetryPeriod:   app.LeaderElection.RetryPeriod.Duration,
 			Callbacks: leaderelection.LeaderCallbacks{
 				OnStartedLeading: func(ctx context.Context) {
+					if err := metrics.RegisterLeaderMetrics(); err != nil {
+						golog.Fatalf("failed to register leader metrics: %v", err)
+					}
+					metrics.SetLeader(true)
 					log.Log.Infof("Started leading")
+
 					// run app
-					stop := ctx.Done()
-					app.informerFactory.Start(stop)
 					go app.kubeVirtController.Run(controllerThreads, stop)
 				},
 				OnStoppedLeading: func() {
+					metrics.SetLeader(false)
+					log.Log.V(5).Info("stop monitoring the kubevirt-config configMap")
 					golog.Fatal("leaderelection lost")
 				},
 			},
@@ -250,10 +465,39 @@ func (app *VirtOperatorApp) Run() {
 		golog.Fatal(err)
 	}
 
-	log.Log.Infof("Attempting to aquire leader status")
-	leaderElector.Run(ctx)
+	metrics.SetReady(true)
+	log.Log.Infof("Attempting to acquire leader status")
+	leaderElector.Run(app.ctx)
+
 	panic("unreachable")
 
+}
+
+// Detects if ServiceMonitor or PrometheusRule crd has been applied or deleted that
+// re-initializing virt-operator.
+func (app *VirtOperatorApp) configModificationCallback() {
+	msgf := "Reinitialize virt-operator, %s has been %s"
+
+	smEnabled := app.clusterConfig.HasServiceMonitorAPI()
+	if app.stores.ServiceMonitorEnabled != smEnabled {
+		if !app.stores.ServiceMonitorEnabled && smEnabled {
+			log.Log.Infof(msgf, "ServiceMonitor", "introduced")
+		} else {
+			log.Log.Infof(msgf, "ServiceMonitor", "removed")
+		}
+		app.reInitChan <- "reinit"
+		return
+	}
+
+	prEnabled := app.clusterConfig.HasPrometheusRuleAPI()
+	if app.stores.PrometheusRulesEnabled != prEnabled {
+		if !app.stores.PrometheusRulesEnabled && prEnabled {
+			log.Log.Infof(msgf, "PrometheusRule", "introduced")
+		} else {
+			log.Log.Infof(msgf, "PrometheusRule", "removed")
+		}
+		app.reInitChan <- "reinit"
+	}
 }
 
 func (app *VirtOperatorApp) getNewRecorder(namespace string, componentName string) record.EventRecorder {
@@ -269,4 +513,28 @@ func (app *VirtOperatorApp) AddFlags() {
 	app.Port = defaultPort
 
 	app.AddCommonFlags()
+}
+
+func (app *VirtOperatorApp) prepareCertManagers() {
+	app.operatorCertManager = bootstrap.NewFallbackCertificateManager(
+		bootstrap.NewSecretCertificateManager(
+			components.VirtOperatorCertSecretName,
+			app.operatorNamespace,
+			app.informers.Secrets.GetStore(),
+		),
+	)
+}
+
+func (app *VirtOperatorApp) shouldChangeLogVerbosity() {
+	verbosity := app.clusterConfig.GetVirtOperatorVerbosity(app.host)
+	if err := log.Log.SetVerbosityLevel(int(verbosity)); err != nil {
+		log.Log.Warningf("failed up update log verbosity to %d: %v", verbosity, err)
+	} else {
+		log.Log.V(2).Infof("set log verbosity to %d", verbosity)
+	}
+}
+
+func (app *VirtOperatorApp) shouldUpdateConfigurationMetrics() {
+	emulationEnabled := app.clusterConfig.GetDeveloperConfigurationUseEmulation()
+	metrics.SetEmulationEnabledMetric(emulationEnabled)
 }

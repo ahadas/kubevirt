@@ -20,160 +20,103 @@
 package virtlauncher
 
 import (
+	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
-	v1 "kubevirt.io/kubevirt/pkg/api/v1"
+	cmdserver "kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/cmd-server"
+
+	"kubevirt.io/client-go/log"
+
 	diskutils "kubevirt.io/kubevirt/pkg/ephemeral-disk-utils"
-	"kubevirt.io/kubevirt/pkg/log"
-	"kubevirt.io/kubevirt/pkg/precond"
-	cmdclient "kubevirt.io/kubevirt/pkg/virt-handler/cmd-client"
-	"kubevirt.io/kubevirt/pkg/watchdog"
+	"kubevirt.io/kubevirt/pkg/util"
 )
 
 type OnShutdownCallback func(pid int)
+type OnGracefulShutdownCallback func()
 
 type monitor struct {
-	timeout                     time.Duration
-	pid                         int
-	cmdlineMatchStr             string
-	start                       time.Time
-	isDone                      bool
-	gracePeriod                 int
-	gracePeriodStartTime        int64
-	gracefulShutdownTriggerFile string
-	shutdownCallback            OnShutdownCallback
+	timeout                  time.Duration
+	pid                      int
+	pidDir                   string
+	domainName               string
+	start                    time.Time
+	isDone                   bool
+	gracePeriod              int
+	gracePeriodStartTime     int64
+	finalShutdownCallback    OnShutdownCallback
+	gracefulShutdownCallback OnGracefulShutdownCallback
 }
 
 type ProcessMonitor interface {
 	RunForever(startTimeout time.Duration, signalStopChan chan struct{})
 }
 
-func GracefulShutdownTriggerDir(baseDir string) string {
-	return filepath.Join(baseDir, "graceful-shutdown-trigger")
-}
-
-func GracefulShutdownTriggerFromNamespaceName(baseDir string, namespace string, name string) string {
-	triggerFile := namespace + "_" + name
-	return filepath.Join(baseDir, "graceful-shutdown-trigger", triggerFile)
-}
-
-func VmGracefulShutdownTriggerClear(baseDir string, vmi *v1.VirtualMachineInstance) error {
-	namespace := precond.MustNotBeEmpty(vmi.GetObjectMeta().GetNamespace())
-	domain := precond.MustNotBeEmpty(vmi.GetObjectMeta().GetName())
-
-	triggerFile := GracefulShutdownTriggerFromNamespaceName(baseDir, namespace, domain)
-
-	return diskutils.RemoveFile(triggerFile)
-}
-
-func GracefulShutdownTriggerClear(triggerFile string) error {
-	return diskutils.RemoveFile(triggerFile)
-}
-
-func VmHasGracefulShutdownTrigger(baseDir string, vmi *v1.VirtualMachineInstance) (bool, error) {
-	namespace := precond.MustNotBeEmpty(vmi.GetObjectMeta().GetNamespace())
-	domain := precond.MustNotBeEmpty(vmi.GetObjectMeta().GetName())
-
-	return hasGracefulShutdownTrigger(baseDir, namespace, domain)
-}
-
-func hasGracefulShutdownTrigger(baseDir string, namespace string, name string) (bool, error) {
-	triggerFile := GracefulShutdownTriggerFromNamespaceName(baseDir, namespace, name)
-
-	return diskutils.FileExists(triggerFile)
-}
-
-func GracefulShutdownTriggerInitiate(triggerFile string) error {
-	exists, err := diskutils.FileExists(triggerFile)
-	if err != nil {
+func InitializePrivateDirectories(baseDir string) error {
+	if err := util.MkdirAllWithNosec(baseDir); err != nil {
 		return err
 	}
-	if exists {
-		return nil
-	}
-
-	f, err := os.Create(triggerFile)
-	if err != nil {
+	if err := diskutils.DefaultOwnershipManager.UnsafeSetFileOwnership(baseDir); err != nil {
 		return err
 	}
-	f.Close()
-
 	return nil
 }
 
-func InitializePrivateDirectories(baseDir string) error {
-	unixPathVNC := filepath.Join(baseDir, "virt-vnc")
-	unixPathConsole := filepath.Join(baseDir, "virt-serial0")
+func InitializeConsoleLogFile(baseDir string) error {
+	logPath := filepath.Join(baseDir, "virt-serial0-log")
 
-	err := os.MkdirAll(filepath.Dir(unixPathVNC), 0755)
-	if err != nil {
+	_, err := os.Stat(logPath)
+	if errors.Is(err, os.ErrNotExist) {
+		file, err := os.Create(logPath)
+		if err != nil {
+			return err
+		}
+		if err = file.Close(); err != nil {
+			return err
+		}
+	} else if err != nil {
 		return err
 	}
-	err = os.MkdirAll(filepath.Dir(unixPathConsole), 0755)
-	if err != nil {
+	if err = diskutils.DefaultOwnershipManager.UnsafeSetFileOwnership(logPath); err != nil {
 		return err
 	}
-	err = diskutils.SetFileOwnership("qemu", filepath.Dir(unixPathVNC))
-	if err != nil {
-		return err
-	}
-	err = diskutils.SetFileOwnership("qemu", filepath.Dir(unixPathConsole))
-	if err != nil {
-		return err
-	}
-
 	return nil
 }
 
 func InitializeDisksDirectories(baseDir string) error {
-	err := os.MkdirAll(baseDir, 0755)
+	err := os.MkdirAll(baseDir, 0750)
 	if err != nil {
 		return err
 	}
 
-	err = os.Chmod(baseDir, 0755)
+	// #nosec G302: Poor file permissions used with chmod. Using the safe permission setting for a directory.
+	err = os.Chmod(baseDir, 0750)
 	if err != nil {
 		return err
 	}
-	err = diskutils.SetFileOwnership("qemu", baseDir)
+	err = diskutils.DefaultOwnershipManager.UnsafeSetFileOwnership(baseDir)
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-func InitializeSharedDirectories(baseDir string) error {
-	err := os.MkdirAll(watchdog.WatchdogFileDirectory(baseDir), 0755)
-	if err != nil {
-		return err
-	}
-
-	err = os.MkdirAll(GracefulShutdownTriggerDir(baseDir), 0755)
-	if err != nil {
-		return err
-	}
-	err = os.MkdirAll(cmdclient.SocketsDirectory(baseDir), 0755)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func NewProcessMonitor(cmdlineMatchStr string,
-	gracefulShutdownTriggerFile string,
+func NewProcessMonitor(domainName string,
+	pidDir string,
 	gracePeriod int,
-	shutdownCallback OnShutdownCallback) ProcessMonitor {
+	finalShutdownCallback OnShutdownCallback,
+	gracefulShutdownCallback OnGracefulShutdownCallback) ProcessMonitor {
 	return &monitor{
-		cmdlineMatchStr:             cmdlineMatchStr,
-		gracePeriod:                 gracePeriod,
-		gracefulShutdownTriggerFile: gracefulShutdownTriggerFile,
-		shutdownCallback:            shutdownCallback,
+		domainName:               domainName,
+		pidDir:                   pidDir,
+		gracePeriod:              gracePeriod,
+		finalShutdownCallback:    finalShutdownCallback,
+		gracefulShutdownCallback: gracefulShutdownCallback,
 	}
 }
 
@@ -191,9 +134,13 @@ func (mon *monitor) refresh() {
 	if mon.isDone {
 		log.Log.Error("Called refresh after done!")
 		return
+	} else if cmdserver.ReceivedEarlyExitSignal() {
+		log.Log.Infof("received early exit signal - stop waiting for %s", mon.domainName)
+		mon.isDone = true
+		return
 	}
 
-	log.Log.V(4).Infof("Refreshing. CommandPrefix %s pid %d", mon.cmdlineMatchStr, mon.pid)
+	log.Log.V(4).Infof("Refreshing. domainName %s pid %d", mon.domainName, mon.pid)
 
 	expired := mon.isGracePeriodExpired()
 
@@ -201,32 +148,43 @@ func (mon *monitor) refresh() {
 	if mon.pid == 0 {
 		var err error
 
-		mon.pid, err = FindPid(mon.cmdlineMatchStr)
+		mon.pid, err = FindPid(mon.domainName, mon.pidDir)
 		if err != nil {
 
-			log.Log.Infof("Still missing PID for %s, %v", mon.cmdlineMatchStr, err)
+			log.Log.Infof("Still missing PID for %s, %v", mon.domainName, err)
 			// check to see if we've timed out looking for the process
 			elapsed := time.Since(mon.start)
 			if mon.timeout > 0 && elapsed >= mon.timeout {
-				log.Log.Infof("%s not found after timeout", mon.cmdlineMatchStr)
+				log.Log.Infof("%s not found after timeout", mon.domainName)
 				mon.isDone = true
 			} else if expired {
-				log.Log.Infof("%s not found after grace period expired", mon.cmdlineMatchStr)
+				log.Log.Infof("%s not found after grace period expired", mon.domainName)
+				mon.isDone = true
+			} else if mon.gracePeriodStartTime != 0 {
+				log.Log.Infof("%s not found after shutdown initiated", mon.domainName)
 				mon.isDone = true
 			}
 			return
 		}
 
-		log.Log.Infof("Found PID for %s: %d", mon.cmdlineMatchStr, mon.pid)
+		log.Log.Infof("Found PID for %s: %d", mon.domainName, mon.pid)
 	}
 
-	exists, err := pidExists(mon.pid)
+	exists, isZombie, err := pidExists(mon.pid)
 	if err != nil {
 		log.Log.Reason(err).Errorf("Error detecting pid (%d) status.", mon.pid)
 		return
 	}
 	if exists == false {
-		log.Log.Infof("Process %s and pid %d is gone!", mon.cmdlineMatchStr, mon.pid)
+		log.Log.Infof("Process %s and pid %d is gone!", mon.domainName, mon.pid)
+		mon.pid = 0
+		mon.isDone = true
+		return
+	}
+
+	if isZombie {
+		log.Log.Infof("Process %s and pid %d is a zombie, sending SIGCHLD to pid 1 to reap process", mon.domainName, mon.pid)
+		syscall.Kill(1, syscall.SIGCHLD)
 		mon.pid = 0
 		mon.isDone = true
 		return
@@ -234,7 +192,7 @@ func (mon *monitor) refresh() {
 
 	if expired {
 		log.Log.Infof("Grace Period expired, shutting down.")
-		mon.shutdownCallback(mon.pid)
+		mon.finalShutdownCallback(mon.pid)
 	}
 
 	return
@@ -251,7 +209,7 @@ func (mon *monitor) monitorLoop(startTimeout time.Duration, signalStopChan chan 
 	log.Log.Infof("Monitoring loop: rate %v start timeout %s", rate, timeoutRepr)
 
 	ticker := time.NewTicker(rate)
-
+	defer ticker.Stop()
 	mon.isDone = false
 	mon.timeout = startTimeout
 	mon.start = time.Now()
@@ -265,72 +223,47 @@ func (mon *monitor) monitorLoop(startTimeout time.Duration, signalStopChan chan 
 				continue
 			}
 
-			err := GracefulShutdownTriggerInitiate(mon.gracefulShutdownTriggerFile)
-			if err != nil {
-				log.Log.Reason(err).Errorf("Error detected attempting to initialize graceful shutdown using trigger file %s.", mon.gracefulShutdownTriggerFile)
-			}
+			mon.gracefulShutdownCallback()
 			mon.gracePeriodStartTime = time.Now().UTC().Unix()
 		}
 	}
 
-	ticker.Stop()
 }
 
 func (mon *monitor) RunForever(startTimeout time.Duration, signalStopChan chan struct{}) {
-
 	mon.monitorLoop(startTimeout, signalStopChan)
 }
 
-func readProcCmdline(pathname string) ([]string, error) {
-	content, err := ioutil.ReadFile(pathname)
+func pidExists(pid int) (exists bool, isZombie bool, err error) {
+
+	pathCmdline := fmt.Sprintf("/proc/%d/cmdline", pid)
+	pathStatus := fmt.Sprintf("/proc/%d/status", pid)
+
+	exists, err = diskutils.FileExists(pathCmdline)
 	if err != nil {
-		return nil, err
-	}
-
-	return strings.Split(string(content), "\x00"), nil
-}
-
-func pidExists(pid int) (bool, error) {
-	path := fmt.Sprintf("/proc/%d/cmdline", pid)
-
-	exists, err := diskutils.FileExists(path)
-	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	if exists == false {
-		return false, nil
+		return false, false, nil
 	}
 
-	return true, nil
+	dataBytes, err := os.ReadFile(pathStatus)
+	if err != nil {
+		return false, false, err
+	}
+
+	if strings.Contains(string(dataBytes), "Z (zombie)") {
+		isZombie = true
+	}
+
+	return exists, isZombie, nil
 }
 
-func FindPid(commandNamePrefix string) (int, error) {
-	entries, err := filepath.Glob("/proc/*/cmdline")
+func FindPid(domainName string, pidDir string) (int, error) {
+	content, err := os.ReadFile(filepath.Join(pidDir, domainName+".pid"))
 	if err != nil {
 		return 0, err
 	}
 
-	for _, entry := range entries {
-		content, err := ioutil.ReadFile(entry)
-		if err != nil {
-			return 0, err
-		}
-
-		if !strings.Contains(string(content), commandNamePrefix) {
-			continue
-		}
-
-		//   <empty> /    proc     /    $PID   /   cmdline
-		// items[0] sep items[1] sep items[2] sep  items[3]
-		items := strings.Split(entry, string(os.PathSeparator))
-		pid, err := strconv.Atoi(items[2])
-		if err != nil {
-			return 0, err
-		}
-
-		// everything matched, hooray!
-		return pid, nil
-	}
-
-	return 0, fmt.Errorf("Process %s not found in /proc", commandNamePrefix)
+	return strconv.Atoi(string(content))
 }

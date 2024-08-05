@@ -1,12 +1,14 @@
 package disruptionbudget_test
 
 import (
+	"fmt"
+
 	"github.com/golang/mock/gomock"
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	v12 "k8s.io/api/core/v1"
-	"k8s.io/api/policy/v1beta1"
-	v13 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -16,9 +18,13 @@ import (
 	framework "k8s.io/client-go/tools/cache/testing"
 	"k8s.io/client-go/tools/record"
 
-	v1 "kubevirt.io/kubevirt/pkg/api/v1"
-	"kubevirt.io/kubevirt/pkg/kubecli"
+	v1 "kubevirt.io/api/core/v1"
+	"kubevirt.io/client-go/api"
+	"kubevirt.io/client-go/kubecli"
+
+	"kubevirt.io/kubevirt/pkg/apimachinery/patch"
 	"kubevirt.io/kubevirt/pkg/testutils"
+	virtconfig "kubevirt.io/kubevirt/pkg/virt-config"
 	"kubevirt.io/kubevirt/pkg/virt-controller/watch/drain/disruptionbudget"
 )
 
@@ -27,26 +33,32 @@ var _ = Describe("Disruptionbudget", func() {
 	var ctrl *gomock.Controller
 	var stop chan struct{}
 	var virtClient *kubecli.MockKubevirtClient
-	var vmiInterface *kubecli.MockVirtualMachineInstanceInterface
 	var vmiSource *framework.FakeControllerSource
 	var vmiInformer cache.SharedIndexInformer
 	var pdbInformer cache.SharedIndexInformer
 	var pdbSource *framework.FakeControllerSource
+	var podInformer cache.SharedIndexInformer
+	var vmimInformer cache.SharedIndexInformer
 	var recorder *record.FakeRecorder
 	var mockQueue *testutils.MockWorkQueue
 	var kubeClient *fake.Clientset
 	var pdbFeeder *testutils.PodDisruptionBudgetFeeder
 	var vmiFeeder *testutils.VirtualMachineFeeder
+	var config *virtconfig.ClusterConfig
 
 	var controller *disruptionbudget.DisruptionBudgetController
 
 	syncCaches := func(stop chan struct{}) {
 		go vmiInformer.Run(stop)
 		go pdbInformer.Run(stop)
+		go podInformer.Run(stop)
+		go vmimInformer.Run(stop)
 
 		Expect(cache.WaitForCacheSync(stop,
 			vmiInformer.HasSynced,
 			pdbInformer.HasSynced,
+			podInformer.HasSynced,
+			vmimInformer.HasSynced,
 		)).To(BeTrue())
 	}
 
@@ -56,7 +68,17 @@ var _ = Describe("Disruptionbudget", func() {
 		mockQueue.Wait()
 	}
 
-	shouldExpectPDBDeletion := func(pdb *v1beta1.PodDisruptionBudget) {
+	addMigration := func(vmim *v1.VirtualMachineInstanceMigration) {
+		err := vmimInformer.GetIndexer().Add(vmim)
+		Expect(err).ToNot(HaveOccurred())
+	}
+
+	addPod := func(pod *corev1.Pod) {
+		err := podInformer.GetIndexer().Add(pod)
+		Expect(err).ToNot(HaveOccurred())
+	}
+
+	shouldExpectPDBDeletion := func(pdb *policyv1.PodDisruptionBudget) {
 		// Expect pod deletion
 		kubeClient.Fake.PrependReactor("delete", "poddisruptionbudgets", func(action testing.Action) (handled bool, obj runtime.Object, err error) {
 			update, ok := action.(testing.DeleteAction)
@@ -71,35 +93,56 @@ var _ = Describe("Disruptionbudget", func() {
 		// Expect pod creation
 		kubeClient.Fake.PrependReactor("create", "poddisruptionbudgets", func(action testing.Action) (handled bool, obj runtime.Object, err error) {
 			update, ok := action.(testing.CreateAction)
-			pdb := update.GetObject().(*v1beta1.PodDisruptionBudget)
+			pdb := update.GetObject().(*policyv1.PodDisruptionBudget)
 			Expect(ok).To(BeTrue())
-			Expect(pdb.Spec.MinAvailable.String()).To(Equal("2"))
-			Expect(update.GetObject().(*v1beta1.PodDisruptionBudget).Spec.Selector.MatchLabels[v1.CreatedByLabel]).To(Equal(string(uid)))
+			Expect(pdb.Spec.MinAvailable.String()).To(Equal("1"))
+			Expect(update.GetObject().(*policyv1.PodDisruptionBudget).Spec.Selector.MatchLabels[v1.CreatedByLabel]).To(Equal(string(uid)))
 			return true, update.GetObject(), nil
 		})
+	}
+
+	shouldExpectPDBPatch := func(vmi *v1.VirtualMachineInstance) {
+		kubeClient.Fake.PrependReactor("patch", "poddisruptionbudgets", func(action testing.Action) (handled bool, obj runtime.Object, err error) {
+			patchAction, ok := action.(testing.PatchAction)
+			Expect(ok).To(BeTrue())
+			Expect(patchAction.GetName()).To(Equal("pdb-" + vmi.Name))
+			Expect(patchAction.GetPatchType()).To(Equal(types.JSONPatchType))
+			patches := patch.New(
+				patch.WithReplace("/spec/minAvailable", 1),
+				patch.WithRemove(fmt.Sprintf("/metadata/labels/%s", patch.EscapeJSONPointer(
+					v1.MigrationNameLabel))),
+			)
+			Expect(patches.GeneratePayload()).To(Equal(patchAction.GetPatch()))
+			return true, &policyv1.PodDisruptionBudget{}, nil
+		})
+	}
+
+	initController := func(kvConfig *v1.KubeVirtConfiguration) {
+		config, _, _ = testutils.NewFakeClusterConfigUsingKVConfig(kvConfig)
+
+		controller, _ = disruptionbudget.NewDisruptionBudgetController(vmiInformer, pdbInformer, podInformer, vmimInformer, recorder, virtClient, config)
+		mockQueue = testutils.NewMockWorkQueue(controller.Queue)
+		controller.Queue = mockQueue
+		pdbFeeder = testutils.NewPodDisruptionBudgetFeeder(mockQueue, pdbSource)
+		vmiFeeder = testutils.NewVirtualMachineFeeder(mockQueue, vmiSource)
 	}
 
 	BeforeEach(func() {
 		stop = make(chan struct{})
 		ctrl = gomock.NewController(GinkgoT())
 		virtClient = kubecli.NewMockKubevirtClient(ctrl)
-		vmiInterface = kubecli.NewMockVirtualMachineInstanceInterface(ctrl)
-
 		vmiInformer, vmiSource = testutils.NewFakeInformerFor(&v1.VirtualMachineInstance{})
-		pdbInformer, pdbSource = testutils.NewFakeInformerFor(&v1beta1.PodDisruptionBudget{})
+		pdbInformer, pdbSource = testutils.NewFakeInformerFor(&policyv1.PodDisruptionBudget{})
+		vmimInformer, _ = testutils.NewFakeInformerFor(&v1.VirtualMachineInstanceMigration{})
+		podInformer, _ = testutils.NewFakeInformerFor(&corev1.Pod{})
 		recorder = record.NewFakeRecorder(100)
-
-		controller = disruptionbudget.NewDisruptionBudgetController(vmiInformer, pdbInformer, recorder, virtClient)
-		mockQueue = testutils.NewMockWorkQueue(controller.Queue)
-		controller.Queue = mockQueue
-		pdbFeeder = testutils.NewPodDisruptionBudgetFeeder(mockQueue, pdbSource)
-		vmiFeeder = testutils.NewVirtualMachineFeeder(mockQueue, vmiSource)
+		recorder.IncludeObject = true
+		initController(&v1.KubeVirtConfiguration{})
 
 		// Set up mock client
-		virtClient.EXPECT().VirtualMachineInstance(v12.NamespaceDefault).Return(vmiInterface).AnyTimes()
 		kubeClient = fake.NewSimpleClientset()
 		virtClient.EXPECT().CoreV1().Return(kubeClient.CoreV1()).AnyTimes()
-		virtClient.EXPECT().PolicyV1beta1().Return(kubeClient.PolicyV1beta1()).AnyTimes()
+		virtClient.EXPECT().PolicyV1().Return(kubeClient.PolicyV1()).AnyTimes()
 
 		// Make sure that all unexpected calls to kubeClient will fail
 		kubeClient.Fake.PrependReactor("*", "*", func(action testing.Action) (handled bool, obj runtime.Object, err error) {
@@ -113,14 +156,14 @@ var _ = Describe("Disruptionbudget", func() {
 	Context("A VirtualMachineInstance given which does not want to live-migrate on evictions", func() {
 
 		It("should do nothing, if no pdb exists", func() {
-			addVirtualMachine(newVirtualMachine("testvm"))
+			addVirtualMachine(nonMigratableVirtualMachine())
 			controller.Execute()
 		})
 
 		It("should remove the pdb, if it is added to the cache", func() {
-			vmi := newVirtualMachine("testvm")
+			vmi := nonMigratableVirtualMachine()
 			addVirtualMachine(vmi)
-			pdb := newPodDisruptionBudget(vmi)
+			pdb := newPodDisruptionBudget(vmi, 1)
 			pdbFeeder.Add(pdb)
 
 			shouldExpectPDBDeletion(pdb)
@@ -129,23 +172,44 @@ var _ = Describe("Disruptionbudget", func() {
 		})
 	})
 
-	Context("A VirtualMachineInstance given which wants to live-migrate on evictions", func() {
+	Context("With cluster that has 'EvictionStrategy' set to 'LiveMigrate'", func() {
+		BeforeEach(func() {
+			evictionStrategy := v1.EvictionStrategyLiveMigrate
+			initController(&v1.KubeVirtConfiguration{EvictionStrategy: &evictionStrategy})
+		})
 
-		It("should do nothing, if a pdb exists", func() {
-			vmi := newVirtualMachine("testvm")
-			vmi.Spec.EvictionStrategy = newEvictionStrategy()
+		It("should add the pdb, if it does not exist", func() {
+			vmi := nonMigratableVirtualMachine()
 			addVirtualMachine(vmi)
-			pdb := newPodDisruptionBudget(vmi)
+
+			shouldExpectPDBCreation(vmi.UID)
+			controller.Execute()
+			testutils.ExpectEvent(recorder, disruptionbudget.SuccessfulCreatePodDisruptionBudgetReason)
+		})
+	})
+
+	Context("A VirtualMachineInstance given which wants perform action on evictions", func() {
+
+		DescribeTable("should do nothing, if a pdb exists", func(evictionStrategy v1.EvictionStrategy, vmi *v1.VirtualMachineInstance) {
+			vmi.Spec.EvictionStrategy = &evictionStrategy
+			addVirtualMachine(vmi)
+			pdb := newPodDisruptionBudget(vmi, 1)
 			pdbFeeder.Add(pdb)
 
 			controller.Execute()
-		})
+		},
+			Entry("with LiveMigrate eviction strategy and non-migratable VMI", v1.EvictionStrategyLiveMigrate, nonMigratableVirtualMachine()),
+			Entry("with External eviction strategy and non-migratable VMI", v1.EvictionStrategyExternal, nonMigratableVirtualMachine()),
+			Entry("with LiveMigrate eviction strategy and migratable VMI", v1.EvictionStrategyLiveMigrate, migratableVirtualMachine()),
+			Entry("with LiveMigrateIfPossible eviction strategy and migratable VMI", v1.EvictionStrategyLiveMigrateIfPossible, migratableVirtualMachine()),
+			Entry("with External eviction strategy and migratable VMI", v1.EvictionStrategyExternal, migratableVirtualMachine()),
+		)
 
-		It("should remove the pdb if the VMI disappears", func() {
-			vmi := newVirtualMachine("testvm")
-			vmi.Spec.EvictionStrategy = newEvictionStrategy()
+		DescribeTable("should remove the pdb if the VMI disappears", func(evictionStrategy v1.EvictionStrategy) {
+			vmi := migratableVirtualMachine()
+			vmi.Spec.EvictionStrategy = &evictionStrategy
 			addVirtualMachine(vmi)
-			pdb := newPodDisruptionBudget(vmi)
+			pdb := newPodDisruptionBudget(vmi, 1)
 			pdbFeeder.Add(pdb)
 
 			controller.Execute()
@@ -154,13 +218,94 @@ var _ = Describe("Disruptionbudget", func() {
 			shouldExpectPDBDeletion(pdb)
 			controller.Execute()
 			testutils.ExpectEvent(recorder, disruptionbudget.SuccessfulDeletePodDisruptionBudgetReason)
-		})
+		},
+			Entry("with LiveMigrate eviction strategy", v1.EvictionStrategyLiveMigrate),
+			Entry("with LiveMigrateIfPossible eviction strategy", v1.EvictionStrategyLiveMigrateIfPossible),
+			Entry("with External eviction strategy", v1.EvictionStrategyExternal),
+		)
+
+		DescribeTable("should remove the pdb if VMI doesn't exist", func(evictionStrategy v1.EvictionStrategy) {
+			vmi := nonMigratableVirtualMachine()
+			vmi.Spec.EvictionStrategy = &evictionStrategy
+			pdb := newPodDisruptionBudget(vmi, 1)
+			pdbFeeder.Add(pdb)
+
+			shouldExpectPDBDeletion(pdb)
+			controller.Execute()
+			testutils.ExpectEvent(recorder, disruptionbudget.SuccessfulDeletePodDisruptionBudgetReason)
+		},
+			Entry("with LiveMigrate eviction strategy", v1.EvictionStrategyLiveMigrate),
+			Entry("with LiveMigrateIfPossible eviction strategy", v1.EvictionStrategyLiveMigrateIfPossible),
+			Entry("with External eviction strategy", v1.EvictionStrategyExternal),
+		)
+
+		DescribeTable("should recreate the PDB if the VMI is recreated", func(evictionStrategy v1.EvictionStrategy) {
+			vmi := migratableVirtualMachine()
+			vmi.Spec.EvictionStrategy = &evictionStrategy
+			addVirtualMachine(vmi)
+			pdb := newPodDisruptionBudget(vmi, 1)
+			pdbFeeder.Add(pdb)
+
+			controller.Execute()
+
+			vmiFeeder.Delete(vmi)
+			shouldExpectPDBDeletion(pdb)
+			controller.Execute()
+			testutils.ExpectEvent(recorder, disruptionbudget.SuccessfulDeletePodDisruptionBudgetReason)
+
+			pdbFeeder.Delete(pdb)
+			vmi.UID = "45356"
+			vmiFeeder.Add(vmi)
+			shouldExpectPDBCreation(vmi.UID)
+			controller.Execute()
+
+			testutils.ExpectEvent(recorder, disruptionbudget.SuccessfulCreatePodDisruptionBudgetReason)
+		},
+			Entry("with LiveMigrate eviction strategy", v1.EvictionStrategyLiveMigrate),
+			Entry("with LiveMigrateIfPossible eviction strategy", v1.EvictionStrategyLiveMigrateIfPossible),
+			Entry("with External eviction strategy", v1.EvictionStrategyExternal),
+		)
+
+		DescribeTable("should delete a PDB which belongs to an old VMI", func(evictionStrategy v1.EvictionStrategy) {
+			vmi := migratableVirtualMachine()
+			vmi.Spec.EvictionStrategy = &evictionStrategy
+			pdb := newPodDisruptionBudget(vmi, 1)
+			pdbFeeder.Add(pdb)
+			// new UID means new VMI
+			vmi.UID = "changed"
+			addVirtualMachine(vmi)
+
+			shouldExpectPDBDeletion(pdb)
+			controller.Execute()
+			testutils.ExpectEvent(recorder, disruptionbudget.SuccessfulDeletePodDisruptionBudgetReason)
+		},
+			Entry("with LiveMigrate eviction strategy", v1.EvictionStrategyLiveMigrate),
+			Entry("with LiveMigrateIfPossible eviction strategy", v1.EvictionStrategyLiveMigrateIfPossible),
+			Entry("with External eviction strategy", v1.EvictionStrategyExternal),
+		)
+
+		DescribeTable("should not create a PDB for VMIs which are already marked for deletion", func(evictionStrategy v1.EvictionStrategy) {
+			vmi := migratableVirtualMachine()
+			vmi.Spec.EvictionStrategy = &evictionStrategy
+			now := metav1.Now()
+			vmi.DeletionTimestamp = &now
+			addVirtualMachine(vmi)
+
+			controller.Execute()
+
+			vmiFeeder.Delete(vmi)
+			controller.Execute()
+		},
+			Entry("with LiveMigrate eviction strategy", v1.EvictionStrategyLiveMigrate),
+			Entry("with LiveMigrateIfPossible eviction strategy", v1.EvictionStrategyLiveMigrateIfPossible),
+			Entry("with External eviction strategy", v1.EvictionStrategyExternal),
+		)
 
 		It("should remove the pdb if the VMI does not want to be migrated anymore", func() {
-			vmi := newVirtualMachine("testvm")
-			vmi.Spec.EvictionStrategy = newEvictionStrategy()
+			vmi := nonMigratableVirtualMachine()
+			vmi.Spec.EvictionStrategy = newEvictionStrategyLiveMigrate()
 			addVirtualMachine(vmi)
-			pdb := newPodDisruptionBudget(vmi)
+			pdb := newPodDisruptionBudget(vmi, 1)
 			pdbFeeder.Add(pdb)
 
 			controller.Execute()
@@ -172,21 +317,25 @@ var _ = Describe("Disruptionbudget", func() {
 			testutils.ExpectEvent(recorder, disruptionbudget.SuccessfulDeletePodDisruptionBudgetReason)
 		})
 
-		It("should add the pdb, if it does not exist", func() {
-			vmi := newVirtualMachine("testvm")
-			vmi.Spec.EvictionStrategy = newEvictionStrategy()
+		DescribeTable("should add the pdb, if it does not exist", func(evictionStrategy v1.EvictionStrategy) {
+			vmi := migratableVirtualMachine()
+			vmi.Spec.EvictionStrategy = &evictionStrategy
 			addVirtualMachine(vmi)
 
 			shouldExpectPDBCreation(vmi.UID)
 			controller.Execute()
 			testutils.ExpectEvent(recorder, disruptionbudget.SuccessfulCreatePodDisruptionBudgetReason)
-		})
+		},
+			Entry("with LiveMigrate eviction strategy", v1.EvictionStrategyLiveMigrate),
+			Entry("with LiveMigrateIfPossible eviction strategy", v1.EvictionStrategyLiveMigrateIfPossible),
+			Entry("with External eviction strategy", v1.EvictionStrategyExternal),
+		)
 
-		It("should recreate the pdb, if it disappears", func() {
-			vmi := newVirtualMachine("testvm")
-			vmi.Spec.EvictionStrategy = newEvictionStrategy()
+		DescribeTable("should recreate the pdb, if it disappears", func(evictionStrategy v1.EvictionStrategy) {
+			vmi := migratableVirtualMachine()
+			vmi.Spec.EvictionStrategy = &evictionStrategy
 			addVirtualMachine(vmi)
-			pdb := newPodDisruptionBudget(vmi)
+			pdb := newPodDisruptionBudget(vmi, 1)
 			pdbFeeder.Add(pdb)
 			controller.Execute()
 
@@ -194,13 +343,17 @@ var _ = Describe("Disruptionbudget", func() {
 			pdbFeeder.Delete(pdb)
 			controller.Execute()
 			testutils.ExpectEvent(recorder, disruptionbudget.SuccessfulCreatePodDisruptionBudgetReason)
-		})
+		},
+			Entry("with LiveMigrate eviction strategy", v1.EvictionStrategyLiveMigrate),
+			Entry("with LiveMigrateIfPossible eviction strategy", v1.EvictionStrategyLiveMigrateIfPossible),
+			Entry("with External eviction strategy", v1.EvictionStrategyExternal),
+		)
 
-		It("should recreate the pdb, if the pdb is orphaned", func() {
-			vmi := newVirtualMachine("testvm")
-			vmi.Spec.EvictionStrategy = newEvictionStrategy()
+		DescribeTable("should recreate the pdb, if the pdb is orphaned", func(evictionStrategy v1.EvictionStrategy) {
+			vmi := migratableVirtualMachine()
+			vmi.Spec.EvictionStrategy = &evictionStrategy
 			addVirtualMachine(vmi)
-			pdb := newPodDisruptionBudget(vmi)
+			pdb := newPodDisruptionBudget(vmi, 1)
 			pdbFeeder.Add(pdb)
 			controller.Execute()
 
@@ -210,37 +363,160 @@ var _ = Describe("Disruptionbudget", func() {
 			pdbFeeder.Modify(newPdb)
 			controller.Execute()
 			testutils.ExpectEvent(recorder, disruptionbudget.SuccessfulCreatePodDisruptionBudgetReason)
+		},
+			Entry("with LiveMigrate eviction strategy", v1.EvictionStrategyLiveMigrate),
+			Entry("with LiveMigrateIfPossible eviction strategy", v1.EvictionStrategyLiveMigrateIfPossible),
+			Entry("with External eviction strategy", v1.EvictionStrategyExternal),
+		)
+
+		It("should shrink the PDB after migration has completed", func() {
+			vmi := nonMigratableVirtualMachine()
+			vmi.Spec.EvictionStrategy = newEvictionStrategyLiveMigrate()
+			vmim := newMigration("testmigration", vmi, v1.MigrationSucceeded)
+			pod := newVMIPod(vmi, corev1.PodRunning)
+
+			addVirtualMachine(vmi)
+			pdb := newPodDisruptionBudget(vmi, 2)
+			pdb.ObjectMeta.Labels = map[string]string{
+				v1.MigrationNameLabel: vmim.Name,
+			}
+			pdbFeeder.Add(pdb)
+			addMigration(vmim)
+			addPod(pod)
+
+			shouldExpectPDBPatch(vmi)
+
+			controller.Execute()
+			testutils.ExpectEvent(recorder, disruptionbudget.SuccessfulUpdatePodDisruptionBudgetReason)
 		})
+
+		It("should shrink the PDB after migration object is gone", func() {
+			vmi := nonMigratableVirtualMachine()
+			vmi.Spec.EvictionStrategy = newEvictionStrategyLiveMigrate()
+
+			addVirtualMachine(vmi)
+			pdb := newPodDisruptionBudget(vmi, 2)
+			pdb.ObjectMeta.Labels = map[string]string{
+				v1.MigrationNameLabel: "testmigration",
+			}
+			pdbFeeder.Add(pdb)
+
+			shouldExpectPDBPatch(vmi)
+
+			controller.Execute()
+			testutils.ExpectEvent(recorder, disruptionbudget.SuccessfulUpdatePodDisruptionBudgetReason)
+		})
+
+		It("should not shrink the PDB while migration is running", func() {
+			vmi := nonMigratableVirtualMachine()
+			vmi.Spec.EvictionStrategy = newEvictionStrategyLiveMigrate()
+			vmim := newMigration("testmigration", vmi, v1.MigrationRunning)
+
+			addVirtualMachine(vmi)
+			pdb := newPodDisruptionBudget(vmi, 2)
+			pdb.ObjectMeta.Labels = map[string]string{
+				v1.MigrationNameLabel: vmim.Name,
+			}
+			pdbFeeder.Add(pdb)
+			addMigration(vmim)
+
+			controller.Execute()
+		})
+
+		DescribeTable("should delete a PDB created by an old migration-controller", func(evictionStrategy v1.EvictionStrategy) {
+			vmi := migratableVirtualMachine()
+			vmi.Spec.EvictionStrategy = &evictionStrategy
+
+			addVirtualMachine(vmi)
+			pdb := newPodDisruptionBudget(vmi, 2)
+			pdb.Name = "kubevirt-migration-pdb-" + vmi.Name
+			pdb.ObjectMeta.Labels = map[string]string{
+				v1.MigrationNameLabel: "testmigration",
+			}
+			pdbFeeder.Add(pdb)
+
+			shouldExpectPDBDeletion(pdb)
+			controller.Execute()
+			testutils.ExpectEvent(recorder, disruptionbudget.SuccessfulDeletePodDisruptionBudgetReason)
+		},
+			Entry("with LiveMigrate eviction strategy", v1.EvictionStrategyLiveMigrate),
+			Entry("with LiveMigrateIfPossible eviction strategy", v1.EvictionStrategyLiveMigrateIfPossible),
+			Entry("with External eviction strategy", v1.EvictionStrategyExternal),
+		)
 	})
 
 	AfterEach(func() {
 		close(stop)
 		// Ensure that we add checks for expected events to every test
 		Expect(recorder.Events).To(BeEmpty())
-		ctrl.Finish()
 	})
 })
 
-func newVirtualMachine(name string) *v1.VirtualMachineInstance {
-	vmi := v1.NewMinimalVMI("testvm")
-	vmi.Namespace = v12.NamespaceDefault
+func newVMIPod(vmi *v1.VirtualMachineInstance, phase corev1.PodPhase) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: vmi.Namespace,
+			Name:      vmi.Name,
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(vmi, v1.VirtualMachineInstanceGroupVersionKind),
+			},
+		},
+		Status: corev1.PodStatus{
+			Phase: phase,
+		},
+	}
+}
+
+func newMigration(name string, vmi *v1.VirtualMachineInstance, phase v1.VirtualMachineInstanceMigrationPhase) *v1.VirtualMachineInstanceMigration {
+	migration := &v1.VirtualMachineInstanceMigration{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: vmi.Namespace,
+		},
+		Spec: v1.VirtualMachineInstanceMigrationSpec{
+			VMIName: vmi.Name,
+		},
+	}
+	migration.Status.Phase = phase
+	return migration
+}
+
+func nonMigratableVirtualMachine() *v1.VirtualMachineInstance {
+	vmi := api.NewMinimalVMI("testvm")
+	vmi.Namespace = corev1.NamespaceDefault
 	vmi.UID = "1234"
 	return vmi
 }
 
-func newPodDisruptionBudget(vmi *v1.VirtualMachineInstance) *v1beta1.PodDisruptionBudget {
-	one := intstr.FromInt(1)
-	return &v1beta1.PodDisruptionBudget{
-		ObjectMeta: v13.ObjectMeta{
-			OwnerReferences: []v13.OwnerReference{
-				*v13.NewControllerRef(vmi, v1.VirtualMachineInstanceGroupVersionKind),
+func migratableVirtualMachine() *v1.VirtualMachineInstance {
+	vmi := api.NewMinimalVMI("testvm")
+	vmi.Namespace = corev1.NamespaceDefault
+	vmi.UID = "1234"
+
+	vmi.Status = v1.VirtualMachineInstanceStatus{
+		Conditions: []v1.VirtualMachineInstanceCondition{
+			{
+				Type:   v1.VirtualMachineInstanceIsMigratable,
+				Status: corev1.ConditionTrue,
 			},
-			GenerateName: "kubevirt-disruption-budget-",
-			Namespace:    vmi.Namespace,
 		},
-		Spec: v1beta1.PodDisruptionBudgetSpec{
-			MinAvailable: &one,
-			Selector: &v13.LabelSelector{
+	}
+	return vmi
+}
+
+func newPodDisruptionBudget(vmi *v1.VirtualMachineInstance, pods int) *policyv1.PodDisruptionBudget {
+	minAvailable := intstr.FromInt(pods)
+	return &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(vmi, v1.VirtualMachineInstanceGroupVersionKind),
+			},
+			Name:      "pdb-" + vmi.Name,
+			Namespace: vmi.Namespace,
+		},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MinAvailable: &minAvailable,
+			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
 					v1.CreatedByLabel: string(vmi.UID),
 				},
@@ -249,7 +525,7 @@ func newPodDisruptionBudget(vmi *v1.VirtualMachineInstance) *v1beta1.PodDisrupti
 	}
 }
 
-func newEvictionStrategy() *v1.EvictionStrategy {
+func newEvictionStrategyLiveMigrate() *v1.EvictionStrategy {
 	strategy := v1.EvictionStrategyLiveMigrate
 	return &strategy
 }

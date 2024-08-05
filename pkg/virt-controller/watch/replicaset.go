@@ -20,12 +20,13 @@
 package watch
 
 import (
+	"context"
 	"fmt"
-	"reflect"
 	"sync"
 	"time"
 
 	k8score "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -33,11 +34,16 @@ import (
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 
-	virtv1 "kubevirt.io/kubevirt/pkg/api/v1"
+	"kubevirt.io/kubevirt/pkg/util/status"
+
+	virtv1 "kubevirt.io/api/core/v1"
+	"kubevirt.io/client-go/kubecli"
+	"kubevirt.io/client-go/log"
+
 	"kubevirt.io/kubevirt/pkg/controller"
-	"kubevirt.io/kubevirt/pkg/kubecli"
-	"kubevirt.io/kubevirt/pkg/log"
 )
+
+const failedRsKeyExtraction = "Failed to extract rsKey from replicaset."
 
 // Reasons for replicaset events
 const (
@@ -63,41 +69,56 @@ const (
 	SuccessfulResumedReplicaSetReason = "SuccessfulResumed"
 )
 
-func NewVMIReplicaSet(vmiInformer cache.SharedIndexInformer, vmiRSInformer cache.SharedIndexInformer, recorder record.EventRecorder, clientset kubecli.KubevirtClient, burstReplicas uint) *VMIReplicaSet {
+func NewVMIReplicaSet(vmiInformer cache.SharedIndexInformer, vmiRSInformer cache.SharedIndexInformer, recorder record.EventRecorder, clientset kubecli.KubevirtClient, burstReplicas uint) (*VMIReplicaSet, error) {
 
 	c := &VMIReplicaSet{
-		Queue:         workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
-		vmiInformer:   vmiInformer,
-		vmiRSInformer: vmiRSInformer,
+		Queue:         workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "virt-controller-replicaset"),
+		vmiIndexer:    vmiInformer.GetIndexer(),
+		vmiRSIndexer:  vmiRSInformer.GetIndexer(),
 		recorder:      recorder,
 		clientset:     clientset,
 		expectations:  controller.NewUIDTrackingControllerExpectations(controller.NewControllerExpectations()),
 		burstReplicas: burstReplicas,
+		statusUpdater: status.NewVMIRSStatusUpdater(clientset),
 	}
 
-	c.vmiRSInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	c.hasSynced = func() bool {
+		return vmiInformer.HasSynced() && vmiRSInformer.HasSynced()
+	}
+
+	_, err := vmiRSInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    c.addReplicaSet,
 		DeleteFunc: c.deleteReplicaSet,
 		UpdateFunc: c.updateReplicaSet,
 	})
 
-	c.vmiInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = vmiInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    c.addVirtualMachine,
 		DeleteFunc: c.deleteVirtualMachine,
 		UpdateFunc: c.updateVirtualMachine,
 	})
 
-	return c
+	if err != nil {
+		return nil, err
+	}
+
+	return c, nil
 }
 
 type VMIReplicaSet struct {
 	clientset     kubecli.KubevirtClient
 	Queue         workqueue.RateLimitingInterface
-	vmiInformer   cache.SharedIndexInformer
-	vmiRSInformer cache.SharedIndexInformer
+	vmiIndexer    cache.Indexer
+	vmiRSIndexer  cache.Indexer
 	recorder      record.EventRecorder
 	expectations  *controller.UIDTrackingControllerExpectations
 	burstReplicas uint
+	statusUpdater *status.VMIRSStatusUpdater
+	hasSynced     func() bool
 }
 
 func (c *VMIReplicaSet) Run(threadiness int, stopCh <-chan struct{}) {
@@ -106,7 +127,7 @@ func (c *VMIReplicaSet) Run(threadiness int, stopCh <-chan struct{}) {
 	log.Log.Info("Starting VirtualMachineInstanceReplicaSet controller.")
 
 	// Wait for cache sync before we start the controller
-	cache.WaitForCacheSync(stopCh, c.vmiInformer.HasSynced, c.vmiRSInformer.HasSynced)
+	cache.WaitForCacheSync(stopCh, c.hasSynced)
 
 	// Start the actual work
 	for i := 0; i < threadiness; i++ {
@@ -140,7 +161,7 @@ func (c *VMIReplicaSet) Execute() bool {
 
 func (c *VMIReplicaSet) execute(key string) error {
 
-	obj, exists, err := c.vmiRSInformer.GetStore().GetByKey(key)
+	obj, exists, err := c.vmiRSIndexer.GetByKey(key)
 	if err != nil {
 		return nil
 	}
@@ -152,6 +173,15 @@ func (c *VMIReplicaSet) execute(key string) error {
 	rs := obj.(*virtv1.VirtualMachineInstanceReplicaSet)
 
 	logger := log.Log.Object(rs)
+
+	// this must be first step in execution. Writing the object
+	// when api version changes ensures our api stored version is updated.
+	if !controller.ObservedLatestApiVersionAnnotation(rs) {
+		rs := rs.DeepCopy()
+		controller.SetLatestApiVersionAnnotation(rs)
+		_, err = c.clientset.ReplicaSet(rs.Namespace).Update(context.Background(), rs, metav1.UpdateOptions{})
+		return err
+	}
 
 	//TODO default rs if necessary, the aggregated apiserver will do that in the future
 	if rs.Spec.Template == nil || rs.Spec.Selector == nil || len(rs.Spec.Template.ObjectMeta.Labels) == 0 {
@@ -183,7 +213,7 @@ func (c *VMIReplicaSet) execute(key string) error {
 	// If any adoptions are attempted, we should first recheck for deletion with
 	// an uncached quorum read sometime after listing VirtualMachines (see kubernetes/kubernetes#42639).
 	canAdoptFunc := controller.RecheckDeletionTimestamp(func() (metav1.Object, error) {
-		fresh, err := c.clientset.ReplicaSet(rs.ObjectMeta.Namespace).Get(rs.ObjectMeta.Name, metav1.GetOptions{})
+		fresh, err := c.clientset.ReplicaSet(rs.ObjectMeta.Namespace).Get(context.Background(), rs.ObjectMeta.Name, metav1.GetOptions{})
 		if err != nil {
 			return nil, err
 		}
@@ -193,12 +223,12 @@ func (c *VMIReplicaSet) execute(key string) error {
 		return fresh, nil
 	})
 	cm := controller.NewVirtualMachineControllerRefManager(controller.RealVirtualMachineControl{Clientset: c.clientset}, rs, selector, virtv1.VirtualMachineInstanceReplicaSetGroupVersionKind, canAdoptFunc)
-	vmis, err = cm.ClaimVirtualMachines(vmis)
+	vmis, err = cm.ClaimVirtualMachineInstances(vmis)
 	if err != nil {
 		return err
 	}
 
-	finishedVmis := c.filterFinishedVMIs(vmis)
+	finishedVmis := append(c.filterFinishedVMIs(vmis), c.filterUnkownVMIs(vmis)...)
 	activeVmis := c.filterActiveVMIs(vmis)
 
 	var scaleErr error
@@ -209,11 +239,6 @@ func (c *VMIReplicaSet) execute(key string) error {
 		if len(finishedVmis) > 0 && scaleErr == nil {
 			scaleErr = c.cleanFinishedVmis(rs, finishedVmis)
 		}
-	}
-	// If the controller is going to be deleted and the orphan finalizer is the next one, release the VMIs. Don't update the status
-	// TODO: Workaround for https://github.com/kubernetes/kubernetes/issues/56348, remove it once it is fixed
-	if rs.ObjectMeta.DeletionTimestamp != nil && controller.HasFinalizer(rs, metav1.FinalizerOrphanDependents) {
-		return c.orphan(cm, rs, activeVmis)
 	}
 
 	if scaleErr != nil {
@@ -228,40 +253,13 @@ func (c *VMIReplicaSet) execute(key string) error {
 	return scaleErr
 }
 
-// orphan removes the owner reference of all VMIs which are owned by the controller instance.
-// Workaround for https://github.com/kubernetes/kubernetes/issues/56348 to make no-cascading deletes possible
-// We don't have to remove the finalizer. This part of the gc is not affected by the mentioned bug
-func (c *VMIReplicaSet) orphan(cm *controller.VirtualMachineControllerRefManager, rs *virtv1.VirtualMachineInstanceReplicaSet, vmis []*virtv1.VirtualMachineInstance) error {
-
-	var wg sync.WaitGroup
-	errChan := make(chan error, len(vmis))
-	wg.Add(len(vmis))
-
-	for _, vmi := range vmis {
-		go func(vmi *virtv1.VirtualMachineInstance) {
-			defer wg.Done()
-			err := cm.ReleaseVirtualMachine(vmi)
-			if err != nil {
-				errChan <- err
-			}
-		}(vmi)
-	}
-	wg.Wait()
-	select {
-	case err := <-errChan:
-		return err
-	default:
-	}
-	return nil
-}
-
 func (c *VMIReplicaSet) scale(rs *virtv1.VirtualMachineInstanceReplicaSet, vmis []*virtv1.VirtualMachineInstance) error {
 	log.Log.V(4).Object(rs).Info("Scale")
 	diff := c.calcDiff(rs, vmis)
 
 	rsKey, err := controller.KeyFunc(rs)
 	if err != nil {
-		log.Log.Object(rs).Reason(err).Error("Failed to extract rsKey from replicaset.")
+		log.Log.Object(rs).Reason(err).Error(failedRsKeyExtraction)
 		return nil
 	}
 
@@ -283,16 +281,16 @@ func (c *VMIReplicaSet) scale(rs *virtv1.VirtualMachineInstanceReplicaSet, vmis 
 		// We have to delete VMIs, use a very simple selection strategy for now
 		// TODO: Possible deletion order: not yet running VMIs < migrating VMIs < other
 		deleteCandidates := vmis[0:diff]
-		c.expectations.ExpectDeletions(rsKey, controller.VirtualMachineKeys(deleteCandidates))
+		c.expectations.ExpectDeletions(rsKey, controller.VirtualMachineInstanceKeys(deleteCandidates))
 		for i := 0; i < diff; i++ {
 			go func(idx int) {
 				defer wg.Done()
 				deleteCandidate := vmis[idx]
-				err := c.clientset.VirtualMachineInstance(rs.ObjectMeta.Namespace).Delete(deleteCandidate.ObjectMeta.Name, &metav1.DeleteOptions{})
+				err := c.clientset.VirtualMachineInstance(rs.ObjectMeta.Namespace).Delete(context.Background(), deleteCandidate.ObjectMeta.Name, metav1.DeleteOptions{})
 				// Don't log an error if it is already deleted
 				if err != nil {
 					// We can't observe a delete if it was not accepted by the server
-					c.expectations.DeletionObserved(rsKey, controller.VirtualMachineKey(deleteCandidate))
+					c.expectations.DeletionObserved(rsKey, controller.VirtualMachineInstanceKey(deleteCandidate))
 					c.recorder.Eventf(rs, k8score.EventTypeWarning, FailedDeleteVirtualMachineReason, "Error deleting virtual machine instance %s: %v", deleteCandidate.ObjectMeta.Name, err)
 					errChan <- err
 					return
@@ -317,7 +315,7 @@ func (c *VMIReplicaSet) scale(rs *virtv1.VirtualMachineInstanceReplicaSet, vmis 
 				// TODO check if vmi labels exist, and when make sure that they match. For now just override them
 				vmi.ObjectMeta.Labels = rs.Spec.Template.ObjectMeta.Labels
 				vmi.ObjectMeta.OwnerReferences = []metav1.OwnerReference{OwnerRef(rs)}
-				vmi, err := c.clientset.VirtualMachineInstance(rs.ObjectMeta.Namespace).Create(vmi)
+				vmi, err := c.clientset.VirtualMachineInstance(rs.ObjectMeta.Namespace).Create(context.Background(), vmi, metav1.CreateOptions{})
 				if err != nil {
 					c.expectations.CreationObserved(rsKey)
 					c.recorder.Eventf(rs, k8score.EventTypeWarning, FailedCreateVirtualMachineReason, "Error creating virtual machine instance: %v", err)
@@ -339,10 +337,11 @@ func (c *VMIReplicaSet) scale(rs *virtv1.VirtualMachineInstanceReplicaSet, vmis 
 	return nil
 }
 
-// filterActiveVMIs takes a list of VMIs and returns all VMIs which are not in a final state and not terminating
+// filterActiveVMIs takes a list of VMIs and returns all VMIs which are not in a final state, not terminating and not unknown
 func (c *VMIReplicaSet) filterActiveVMIs(vmis []*virtv1.VirtualMachineInstance) []*virtv1.VirtualMachineInstance {
 	return filter(vmis, func(vmi *virtv1.VirtualMachineInstance) bool {
-		return !vmi.IsFinal() && vmi.DeletionTimestamp == nil
+		return !vmi.IsFinal() && vmi.DeletionTimestamp == nil &&
+			!controller.NewVirtualMachineInstanceConditionManager().HasConditionWithStatusAndReason(vmi, virtv1.VirtualMachineInstanceConditionType(k8score.PodReady), k8score.ConditionFalse, virtv1.PodTerminatingReason)
 	})
 }
 
@@ -360,6 +359,14 @@ func (c *VMIReplicaSet) filterFinishedVMIs(vmis []*virtv1.VirtualMachineInstance
 	})
 }
 
+// filterUnknownVMIs takes a list of VMIs and returns all VMIs which are in an unknown and not yet terminating stage
+func (c *VMIReplicaSet) filterUnkownVMIs(vmis []*virtv1.VirtualMachineInstance) []*virtv1.VirtualMachineInstance {
+	return filter(vmis, func(vmi *virtv1.VirtualMachineInstance) bool {
+		return !vmi.IsFinal() && vmi.DeletionTimestamp == nil &&
+			controller.NewVirtualMachineInstanceConditionManager().HasConditionWithStatusAndReason(vmi, virtv1.VirtualMachineInstanceConditionType(k8score.PodReady), k8score.ConditionFalse, virtv1.PodTerminatingReason)
+	})
+}
+
 func filter(vmis []*virtv1.VirtualMachineInstance, f func(vmi *virtv1.VirtualMachineInstance) bool) []*virtv1.VirtualMachineInstance {
 	filtered := []*virtv1.VirtualMachineInstance{}
 	for _, vmi := range vmis {
@@ -372,7 +379,7 @@ func filter(vmis []*virtv1.VirtualMachineInstance, f func(vmi *virtv1.VirtualMac
 
 // listVMIsFromNamespace takes a namespace and returns all VMIs from the VirtualMachineInstance cache which run in this namespace
 func (c *VMIReplicaSet) listVMIsFromNamespace(namespace string) ([]*virtv1.VirtualMachineInstance, error) {
-	objs, err := c.vmiInformer.GetIndexer().ByIndex(cache.NamespaceIndex, namespace)
+	objs, err := c.vmiIndexer.ByIndex(cache.NamespaceIndex, namespace)
 	if err != nil {
 		return nil, err
 	}
@@ -385,7 +392,7 @@ func (c *VMIReplicaSet) listVMIsFromNamespace(namespace string) ([]*virtv1.Virtu
 
 // listControllerFromNamespace takes a namespace and returns all VMIReplicaSets from the ReplicaSet cache which run in this namespace
 func (c *VMIReplicaSet) listControllerFromNamespace(namespace string) ([]*virtv1.VirtualMachineInstanceReplicaSet, error) {
-	objs, err := c.vmiRSInformer.GetIndexer().ByIndex(cache.NamespaceIndex, namespace)
+	objs, err := c.vmiRSIndexer.ByIndex(cache.NamespaceIndex, namespace)
 	if err != nil {
 		return nil, err
 	}
@@ -476,7 +483,7 @@ func (c *VMIReplicaSet) updateVirtualMachine(old, cur interface{}) {
 		return
 	}
 
-	labelChanged := !reflect.DeepEqual(curVMI.Labels, oldVMI.Labels)
+	labelChanged := !equality.Semantic.DeepEqual(curVMI.Labels, oldVMI.Labels)
 	if curVMI.DeletionTimestamp != nil {
 		// when a vmi is deleted gracefully it's deletion timestamp is first modified to reflect a grace period,
 		// and after such time has passed, the virt-handler actually deletes it from the store. We receive an update
@@ -493,7 +500,7 @@ func (c *VMIReplicaSet) updateVirtualMachine(old, cur interface{}) {
 
 	curControllerRef := metav1.GetControllerOf(curVMI)
 	oldControllerRef := metav1.GetControllerOf(oldVMI)
-	controllerRefChanged := !reflect.DeepEqual(curControllerRef, oldControllerRef)
+	controllerRefChanged := !equality.Semantic.DeepEqual(curControllerRef, oldControllerRef)
 	if controllerRefChanged && oldControllerRef != nil {
 		// The ControllerRef was changed. Sync the old controller, if any.
 		if rs := c.resolveControllerRef(oldVMI.Namespace, oldControllerRef); rs != nil {
@@ -563,7 +570,7 @@ func (c *VMIReplicaSet) deleteVirtualMachine(obj interface{}) {
 	if err != nil {
 		return
 	}
-	c.expectations.DeletionObserved(rsKey, controller.VirtualMachineKey(vmi))
+	c.expectations.DeletionObserved(rsKey, controller.VirtualMachineInstanceKey(vmi))
 	c.enqueueReplicaSet(rs)
 }
 
@@ -575,7 +582,7 @@ func (c *VMIReplicaSet) deleteReplicaSet(obj interface{}) {
 	c.enqueueReplicaSet(obj)
 }
 
-func (c *VMIReplicaSet) updateReplicaSet(old, curr interface{}) {
+func (c *VMIReplicaSet) updateReplicaSet(_, curr interface{}) {
 	c.enqueueReplicaSet(curr)
 }
 
@@ -584,7 +591,8 @@ func (c *VMIReplicaSet) enqueueReplicaSet(obj interface{}) {
 	rs := obj.(*virtv1.VirtualMachineInstanceReplicaSet)
 	key, err := controller.KeyFunc(rs)
 	if err != nil {
-		logger.Object(rs).Reason(err).Error("Failed to extract rsKey from replicaset.")
+		logger.Object(rs).Reason(err).Error(failedRsKeyExtraction)
+		return
 	}
 	c.Queue.Add(key)
 }
@@ -610,7 +618,7 @@ func max(x int, y int) int {
 	return y
 }
 
-//limit
+// limit
 func limit(x int, burstReplicas uint) int {
 	replicas := int(burstReplicas)
 	if x <= 0 {
@@ -674,7 +682,7 @@ func (c *VMIReplicaSet) updateStatus(rs *virtv1.VirtualMachineInstanceReplicaSet
 	// Add/Remove Failure condition if necessary
 	c.checkFailure(rs, diff, scaleErr)
 
-	_, err = c.clientset.ReplicaSet(rs.ObjectMeta.Namespace).Update(rs)
+	err = c.statusUpdater.UpdateStatus(rs)
 
 	if err != nil {
 		return err
@@ -773,7 +781,7 @@ func (c *VMIReplicaSet) resolveControllerRef(namespace string, controllerRef *me
 	if controllerRef.Kind != virtv1.VirtualMachineInstanceReplicaSetGroupVersionKind.Kind {
 		return nil
 	}
-	rs, exists, err := c.vmiRSInformer.GetStore().GetByKey(namespace + "/" + controllerRef.Name)
+	rs, exists, err := c.vmiRSIndexer.GetByKey(namespace + "/" + controllerRef.Name)
 	if err != nil {
 		return nil
 	}
@@ -792,7 +800,7 @@ func (c *VMIReplicaSet) resolveControllerRef(namespace string, controllerRef *me
 func (c *VMIReplicaSet) cleanFinishedVmis(rs *virtv1.VirtualMachineInstanceReplicaSet, vmis []*virtv1.VirtualMachineInstance) error {
 	rsKey, err := controller.KeyFunc(rs)
 	if err != nil {
-		log.Log.Object(rs).Reason(err).Error("Failed to extract rsKey from replicaset.")
+		log.Log.Object(rs).Reason(err).Error(failedRsKeyExtraction)
 		return nil
 	}
 
@@ -806,16 +814,16 @@ func (c *VMIReplicaSet) cleanFinishedVmis(rs *virtv1.VirtualMachineInstanceRepli
 
 	log.Log.V(4).Object(rs).Info("Delete finished VM's")
 	deleteCandidates := vmis[0:diff]
-	c.expectations.ExpectDeletions(rsKey, controller.VirtualMachineKeys(deleteCandidates))
+	c.expectations.ExpectDeletions(rsKey, controller.VirtualMachineInstanceKeys(deleteCandidates))
 	for i := 0; i < diff; i++ {
 		go func(idx int) {
 			defer wg.Done()
 			deleteCandidate := vmis[idx]
-			err := c.clientset.VirtualMachineInstance(rs.ObjectMeta.Namespace).Delete(deleteCandidate.ObjectMeta.Name, &metav1.DeleteOptions{})
+			err := c.clientset.VirtualMachineInstance(rs.ObjectMeta.Namespace).Delete(context.Background(), deleteCandidate.ObjectMeta.Name, metav1.DeleteOptions{})
 			// Don't log an error if it is already deleted
 			if err != nil {
 				// We can't observe a delete if it was not accepted by the server
-				c.expectations.DeletionObserved(rsKey, controller.VirtualMachineKey(deleteCandidate))
+				c.expectations.DeletionObserved(rsKey, controller.VirtualMachineInstanceKey(deleteCandidate))
 				c.recorder.Eventf(rs, k8score.EventTypeWarning, FailedDeleteVirtualMachineReason, "Error deleting finished virtual machine %s: %v", deleteCandidate.ObjectMeta.Name, err)
 				errChan <- err
 				return

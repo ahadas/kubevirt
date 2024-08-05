@@ -7,7 +7,7 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/certificates/triple:go_default_library",
-        "//vendor/k8s.io/client-go/util/cert:go_default_library",
+        "//pkg/certificates/triple/cert:go_default_library",
         "//vendor/k8s.io/client-go/util/certificate:go_default_library",
     ],
 )
@@ -18,10 +18,10 @@ go_test(
         "certificates_suite_test.go",
         "certificates_test.go",
     ],
-    embed = [":go_default_library"],
     deps = [
-        "//pkg/log:go_default_library",
-        "//vendor/github.com/onsi/ginkgo:go_default_library",
+        ":go_default_library",
+        "//staging/src/kubevirt.io/client-go/testutils:go_default_library",
+        "//vendor/github.com/onsi/ginkgo/v2:go_default_library",
         "//vendor/github.com/onsi/gomega:go_default_library",
     ],
 )

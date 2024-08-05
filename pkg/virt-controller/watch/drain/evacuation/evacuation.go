@@ -1,6 +1,7 @@
 package evacuation
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"sync"
@@ -17,10 +18,17 @@ import (
 
 	migrationutils "kubevirt.io/kubevirt/pkg/util/migrations"
 
-	virtv1 "kubevirt.io/kubevirt/pkg/api/v1"
+	virtv1 "kubevirt.io/api/core/v1"
+	"kubevirt.io/client-go/kubecli"
+	"kubevirt.io/client-go/log"
+
 	"kubevirt.io/kubevirt/pkg/controller"
-	"kubevirt.io/kubevirt/pkg/kubecli"
-	"kubevirt.io/kubevirt/pkg/log"
+)
+
+const (
+	deleteNotifFail       = "Failed to process delete notification"
+	getObjectErrFmt       = "couldn't get object from tombstone %+v"
+	objectNotMigrationFmt = "tombstone contained object that is not a migration %#v"
 )
 
 const (
@@ -34,6 +42,7 @@ type EvacuationController struct {
 	clientset             kubecli.KubevirtClient
 	Queue                 workqueue.RateLimitingInterface
 	vmiInformer           cache.SharedIndexInformer
+	vmiPodInformer        cache.SharedIndexInformer
 	migrationInformer     cache.SharedIndexInformer
 	recorder              record.EventRecorder
 	migrationExpectations *controller.UIDTrackingControllerExpectations
@@ -45,41 +54,53 @@ func NewEvacuationController(
 	vmiInformer cache.SharedIndexInformer,
 	migrationInformer cache.SharedIndexInformer,
 	nodeInformer cache.SharedIndexInformer,
+	vmiPodInformer cache.SharedIndexInformer,
 	recorder record.EventRecorder,
 	clientset kubecli.KubevirtClient,
 	clusterConfig *virtconfig.ClusterConfig,
-) *EvacuationController {
+) (*EvacuationController, error) {
 
 	c := &EvacuationController{
-		Queue:                 workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
+		Queue:                 workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "virt-controller-evacuation"),
 		vmiInformer:           vmiInformer,
 		migrationInformer:     migrationInformer,
 		nodeInformer:          nodeInformer,
+		vmiPodInformer:        vmiPodInformer,
 		recorder:              recorder,
 		clientset:             clientset,
 		migrationExpectations: controller.NewUIDTrackingControllerExpectations(controller.NewControllerExpectations()),
 		clusterConfig:         clusterConfig,
 	}
 
-	c.vmiInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, err := c.vmiInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    c.addVirtualMachineInstance,
 		DeleteFunc: c.deleteVirtualMachineInstance,
 		UpdateFunc: c.updateVirtualMachineInstance,
 	})
 
-	c.migrationInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = c.migrationInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    c.addMigration,
 		DeleteFunc: c.deleteMigration,
 		UpdateFunc: c.updateMigration,
 	})
 
-	c.nodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	if err != nil {
+		return nil, err
+	}
+	_, err = c.nodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    c.addNode,
 		DeleteFunc: c.deleteNode,
 		UpdateFunc: c.updateNode,
 	})
 
-	return c
+	if err != nil {
+		return nil, err
+	}
+	return c, nil
 }
 
 func (c *EvacuationController) addNode(obj interface{}) {
@@ -90,7 +111,7 @@ func (c *EvacuationController) deleteNode(obj interface{}) {
 	c.enqueueNode(obj)
 }
 
-func (c *EvacuationController) updateNode(old, curr interface{}) {
+func (c *EvacuationController) updateNode(_, curr interface{}) {
 	c.enqueueNode(curr)
 }
 
@@ -100,6 +121,7 @@ func (c *EvacuationController) enqueueNode(obj interface{}) {
 	key, err := controller.KeyFunc(node)
 	if err != nil {
 		logger.Object(node).Reason(err).Error("Failed to extract key from node.")
+		return
 	}
 	c.Queue.Add(key)
 }
@@ -112,7 +134,7 @@ func (c *EvacuationController) deleteVirtualMachineInstance(obj interface{}) {
 	c.enqueueVMI(obj)
 }
 
-func (c *EvacuationController) updateVirtualMachineInstance(old, curr interface{}) {
+func (c *EvacuationController) updateVirtualMachineInstance(_, curr interface{}) {
 	c.enqueueVMI(curr)
 }
 
@@ -126,12 +148,12 @@ func (c *EvacuationController) enqueueVMI(obj interface{}) {
 	if !ok {
 		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
 		if !ok {
-			log.Log.Reason(fmt.Errorf("couldn't get object from tombstone %+v", obj)).Error("Failed to process delete notification")
+			log.Log.Reason(fmt.Errorf(getObjectErrFmt, obj)).Error(deleteNotifFail)
 			return
 		}
 		vmi, ok = tombstone.Obj.(*virtv1.VirtualMachineInstance)
 		if !ok {
-			log.Log.Reason(fmt.Errorf("tombstone contained object that is not a migration %#v", obj)).Error("Failed to process delete notification")
+			log.Log.Reason(fmt.Errorf(objectNotMigrationFmt, obj)).Error(deleteNotifFail)
 			return
 		}
 	}
@@ -151,12 +173,12 @@ func (c *EvacuationController) nodeFromVMI(obj interface{}) string {
 	if !ok {
 		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
 		if !ok {
-			log.Log.Reason(fmt.Errorf("couldn't get object from tombstone %+v", obj)).Error("Failed to process delete notification")
+			log.Log.Reason(fmt.Errorf(getObjectErrFmt, obj)).Error(deleteNotifFail)
 			return ""
 		}
 		vmi, ok = tombstone.Obj.(*virtv1.VirtualMachineInstance)
 		if !ok {
-			log.Log.Reason(fmt.Errorf("tombstone contained object that is not a migration %#v", obj)).Error("Failed to process delete notification")
+			log.Log.Reason(fmt.Errorf(objectNotMigrationFmt, obj)).Error(deleteNotifFail)
 			return ""
 		}
 	}
@@ -165,16 +187,26 @@ func (c *EvacuationController) nodeFromVMI(obj interface{}) string {
 
 func (c *EvacuationController) addMigration(obj interface{}) {
 	migration := obj.(*virtv1.VirtualMachineInstanceMigration)
-	o, exists, err := c.vmiInformer.GetStore().GetByKey(migration.Namespace + "/" + migration.Spec.VMIName)
-	if err != nil {
-		return
-	}
-	if exists {
-		node := c.nodeFromVMI(o)
-		if node != "" {
-			c.migrationExpectations.CreationObserved(node)
-			c.Queue.Add(node)
+
+	node := ""
+
+	// only observe the migration expectation if our controller created it
+	key, ok := migration.Annotations[virtv1.EvacuationMigrationAnnotation]
+	if ok {
+		c.migrationExpectations.CreationObserved(key)
+		node = key
+	} else {
+		o, exists, err := c.vmiInformer.GetStore().GetByKey(migration.Namespace + "/" + migration.Spec.VMIName)
+		if err != nil {
+			return
 		}
+		if exists {
+			node = c.nodeFromVMI(o)
+		}
+	}
+
+	if node != "" {
+		c.Queue.Add(node)
 	}
 }
 
@@ -182,7 +214,7 @@ func (c *EvacuationController) deleteMigration(obj interface{}) {
 	c.enqueueMigration(obj)
 }
 
-func (c *EvacuationController) updateMigration(old, curr interface{}) {
+func (c *EvacuationController) updateMigration(_, curr interface{}) {
 	c.enqueueMigration(curr)
 }
 
@@ -196,12 +228,12 @@ func (c *EvacuationController) enqueueMigration(obj interface{}) {
 	if !ok {
 		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
 		if !ok {
-			log.Log.Reason(fmt.Errorf("couldn't get object from tombstone %+v", obj)).Error("Failed to process delete notification")
+			log.Log.Reason(fmt.Errorf(getObjectErrFmt, obj)).Error(deleteNotifFail)
 			return
 		}
 		migration, ok = tombstone.Obj.(*virtv1.VirtualMachineInstanceMigration)
 		if !ok {
-			log.Log.Reason(fmt.Errorf("tombstone contained object that is not a migration %#v", obj)).Error("Failed to process delete notification")
+			log.Log.Reason(fmt.Errorf(objectNotMigrationFmt, obj)).Error(deleteNotifFail)
 			return
 		}
 	}
@@ -220,6 +252,7 @@ func (c *EvacuationController) enqueueVirtualMachine(obj interface{}) {
 	key, err := controller.KeyFunc(vmi)
 	if err != nil {
 		logger.Object(vmi).Reason(err).Error("Failed to extract key from virtualmachineinstance.")
+		return
 	}
 	c.Queue.Add(key)
 }
@@ -251,7 +284,13 @@ func (c *EvacuationController) Run(threadiness int, stopCh <-chan struct{}) {
 	log.Log.Info("Starting evacuation controller.")
 
 	// Wait for cache sync before we start the node controller
-	cache.WaitForCacheSync(stopCh, c.migrationInformer.HasSynced, c.vmiInformer.HasSynced)
+	cache.WaitForCacheSync(
+		stopCh,
+		c.vmiInformer.HasSynced,
+		c.vmiPodInformer.HasSynced,
+		c.migrationInformer.HasSynced,
+		c.nodeInformer.HasSynced,
+	)
 
 	// Start the actual work
 	for i := 0; i < threadiness; i++ {
@@ -305,53 +344,73 @@ func (c *EvacuationController) execute(key string) error {
 
 	node := obj.(*k8sv1.Node)
 
-	// If the node has no drain taint, we have nothing to do
-	taintKey := *c.clusterConfig.GetMigrationConfig().NodeDrainTaintKey
-	taint := &k8sv1.Taint{
-		Key:    taintKey,
-		Effect: k8sv1.TaintEffectNoSchedule,
-	}
-
-	if !nodeHasTaint(taint, node) {
-		return nil
-	}
-
 	vmis, err := c.listVMIsOnNode(node.Name)
 	if err != nil {
 		return fmt.Errorf("failed to list VMIs on node: %v", err)
 	}
 
-	migrations, err := migrationutils.ListUnfinishedMigrations(c.migrationInformer)
-
-	if err != nil {
-		return fmt.Errorf("failed to list not finished migrations: %v", err)
-	}
+	migrations := migrationutils.ListUnfinishedMigrations(c.migrationInformer.GetStore())
 
 	return c.sync(node, vmis, migrations)
+}
 
+func getMarkedForEvictionVMIs(vmis []*virtv1.VirtualMachineInstance) []*virtv1.VirtualMachineInstance {
+	var evictionCandidates []*virtv1.VirtualMachineInstance
+	for _, vmi := range vmis {
+		if vmi.IsMarkedForEviction() && !hasMigratedOnEviction(vmi) && !migrationutils.IsMigrating(vmi) {
+			evictionCandidates = append(evictionCandidates, vmi)
+		}
+	}
+	return evictionCandidates
+}
+
+func GenerateNewMigration(vmiName string, key string) *virtv1.VirtualMachineInstanceMigration {
+
+	annotations := map[string]string{
+		virtv1.EvacuationMigrationAnnotation: key,
+	}
+	return &virtv1.VirtualMachineInstanceMigration{
+		ObjectMeta: v1.ObjectMeta{
+			Annotations:  annotations,
+			GenerateName: "kubevirt-evacuation-",
+		},
+		Spec: virtv1.VirtualMachineInstanceMigrationSpec{
+			VMIName: vmiName,
+		},
+	}
 }
 
 func (c *EvacuationController) sync(node *k8sv1.Node, vmisOnNode []*virtv1.VirtualMachineInstance, activeMigrations []*virtv1.VirtualMachineInstanceMigration) error {
-	if len(vmisOnNode) == 0 {
-		// nothing to do
+	// If the node has no drain taint, we have nothing to do
+	taintKey := *c.clusterConfig.GetMigrationConfiguration().NodeDrainTaintKey
+	taint := &k8sv1.Taint{
+		Key:    taintKey,
+		Effect: k8sv1.TaintEffectNoSchedule,
+	}
+
+	vmisToMigrate := vmisToMigrate(node, vmisOnNode, taint)
+	if len(vmisToMigrate) == 0 {
 		return nil
 	}
 
-	migrationCandidates, nonMigrateable := c.filterRunningNonMigratingVMIs(vmisOnNode, activeMigrations)
-
-	// Don't create hundreds of pending migration objects.
-	// This is just best-effort and is *not* intended to not overload the cluster.
-	// It is possible that more migrations than the limit are created because of evacuations on other nodes.
-	// The migration controller needs to limit itself to a reasonable number of running migrations
-	maxParallelMigrations := int(*c.clusterConfig.GetMigrationConfig().ParallelMigrationsPerCluster)
-	if len(activeMigrations) >= maxParallelMigrations {
-		// We have to re-enqueue if some work is left, since migrations from other controllers or workers` don't wake us up again
-		if len(migrationCandidates) > 0 || len(nonMigrateable) > 0 {
-			c.Queue.AddAfter(node.Name, 5*time.Second)
-		}
+	migrationCandidates, nonMigrateable := c.filterRunningNonMigratingVMIs(vmisToMigrate, activeMigrations)
+	if len(migrationCandidates) == 0 && len(nonMigrateable) == 0 {
 		return nil
 	}
-	freeSpots := maxParallelMigrations - len(activeMigrations)
+
+	runningMigrations := migrationutils.FilterRunningMigrations(activeMigrations)
+	activeMigrationsFromThisSourceNode := c.numOfVMIMForThisSourceNode(vmisOnNode, runningMigrations)
+	maxParallelMigrationsPerOutboundNode :=
+		int(*c.clusterConfig.GetMigrationConfiguration().ParallelOutboundMigrationsPerNode)
+	maxParallelMigrations := int(*c.clusterConfig.GetMigrationConfiguration().ParallelMigrationsPerCluster)
+	freeSpotsPerCluster := maxParallelMigrations - len(runningMigrations)
+	freeSpotsPerThisSourceNode := maxParallelMigrationsPerOutboundNode - activeMigrationsFromThisSourceNode
+	freeSpots := int(math.Min(float64(freeSpotsPerCluster), float64(freeSpotsPerThisSourceNode)))
+	if freeSpots <= 0 {
+		c.Queue.AddAfter(node.Name, 5*time.Second)
+		return nil
+	}
+
 	diff := int(math.Min(float64(freeSpots), float64(len(migrationCandidates))))
 	remaining := freeSpots - diff
 	remainingForNonMigrateableDiff := int(math.Min(float64(remaining), float64(len(nonMigrateable))))
@@ -388,14 +447,7 @@ func (c *EvacuationController) sync(node *k8sv1.Node, vmisOnNode []*virtv1.Virtu
 	for _, vmi := range selectedCandidates {
 		go func(vmi *virtv1.VirtualMachineInstance) {
 			defer wg.Done()
-			createdMigration, err := c.clientset.VirtualMachineInstanceMigration(vmi.Namespace).Create(&virtv1.VirtualMachineInstanceMigration{
-				ObjectMeta: v1.ObjectMeta{
-					GenerateName: "kubevirt-evacuation-",
-				},
-				Spec: virtv1.VirtualMachineInstanceMigrationSpec{
-					VMIName: vmi.Name,
-				},
-			})
+			createdMigration, err := c.clientset.VirtualMachineInstanceMigration(vmi.Namespace).Create(context.Background(), GenerateNewMigration(vmi.Name, node.Name), v1.CreateOptions{})
 			if err != nil {
 				c.migrationExpectations.CreationObserved(node.Name)
 				c.recorder.Eventf(vmi, k8sv1.EventTypeWarning, FailedCreateVirtualMachineInstanceMigrationReason, "Error creating a Migration: %v", err)
@@ -417,6 +469,20 @@ func (c *EvacuationController) sync(node *k8sv1.Node, vmisOnNode []*virtv1.Virtu
 	return nil
 }
 
+func hasMigratedOnEviction(vmi *virtv1.VirtualMachineInstance) bool {
+	return vmi.Status.NodeName != vmi.Status.EvacuationNodeName
+}
+
+func vmisToMigrate(node *k8sv1.Node, vmisOnNode []*virtv1.VirtualMachineInstance, taint *k8sv1.Taint) []*virtv1.VirtualMachineInstance {
+	var vmisToMigrate []*virtv1.VirtualMachineInstance
+	if nodeHasTaint(taint, node) {
+		vmisToMigrate = vmisOnNode
+	} else if evictedVMIs := getMarkedForEvictionVMIs(vmisOnNode); len(evictedVMIs) > 0 {
+		vmisToMigrate = evictedVMIs
+	}
+	return vmisToMigrate
+}
+
 func (c *EvacuationController) listVMIsOnNode(nodeName string) ([]*virtv1.VirtualMachineInstance, error) {
 	objs, err := c.vmiInformer.GetIndexer().ByIndex("node", nodeName)
 	if err != nil {
@@ -436,9 +502,13 @@ func (c *EvacuationController) filterRunningNonMigratingVMIs(vmis []*virtv1.Virt
 	}
 
 	for _, vmi := range vmis {
+		// vmi is shutting down
+		if vmi.IsFinal() || vmi.DeletionTimestamp != nil {
+			continue
+		}
 
 		// does not want to migrate
-		if vmi.Spec.EvictionStrategy == nil || *vmi.Spec.EvictionStrategy != virtv1.EvictionStrategyLiveMigrate {
+		if !migrationutils.VMIMigratableOnEviction(c.clusterConfig, vmi) {
 			continue
 		}
 		// can't migrate
@@ -446,16 +516,31 @@ func (c *EvacuationController) filterRunningNonMigratingVMIs(vmis []*virtv1.Virt
 			nonMigrateable = append(nonMigrateable, vmi)
 			continue
 		}
-		if exists := lookup[vmi.Namespace+"/"+vmi.Name]; !exists &&
-			!vmi.IsFinal() && vmi.DeletionTimestamp == nil {
-			// no migration exists,
-			// the vmi is running,
-			migrateable = append(migrateable, vmi)
+
+		hasMigration := lookup[vmi.Namespace+"/"+vmi.Name]
+		// already migrating
+		if hasMigration {
+			continue
 		}
+
+		if controller.VMIActivePodsCount(vmi, c.vmiPodInformer.GetIndexer()) > 1 {
+			// waiting on target/source pods from a previous migration to terminate
+			//
+			// We only want to create a migration when num pods == 1 or else we run the
+			// risk of invalidating our pdb which prevents the VMI from being evicted
+			continue
+		}
+
+		// no migration exists,
+		// the vmi is running,
+		// only one pod is currently active for vmi
+		migrateable = append(migrateable, vmi)
 	}
 	return migrateable, nonMigrateable
 }
 
+// deprecated
+// This node evacuation method is deprecated. Use node drain to trigger evictions instead.
 func nodeHasTaint(taint *k8sv1.Taint, node *k8sv1.Node) bool {
 	for _, t := range node.Spec.Taints {
 		if t.MatchTaint(taint) {
@@ -465,9 +550,20 @@ func nodeHasTaint(taint *k8sv1.Taint, node *k8sv1.Node) bool {
 	return false
 }
 
-type notolerate struct {
-	VMI                *virtv1.VirtualMachineInstance
-	NotTolerated       []k8sv1.Taint
-	TemporaryTolerated []k8sv1.Taint
-	FirstReque         *time.Time
+func (c *EvacuationController) numOfVMIMForThisSourceNode(
+	vmisOnNode []*virtv1.VirtualMachineInstance,
+	activeMigrations []*virtv1.VirtualMachineInstanceMigration) (activeMigrationsFromThisSourceNode int) {
+
+	vmiMap := make(map[string]bool)
+	for _, vmi := range vmisOnNode {
+		vmiMap[vmi.Name] = true
+	}
+
+	for _, vmim := range activeMigrations {
+		if _, ok := vmiMap[vmim.Spec.VMIName]; ok {
+			activeMigrationsFromThisSourceNode++
+		}
+	}
+
+	return
 }

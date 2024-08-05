@@ -20,64 +20,57 @@
 package tests_test
 
 import (
-	"flag"
+	"context"
 	"time"
 
+	"kubevirt.io/kubevirt/tests/decorators"
+
 	expect "github.com/google/goexpect"
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	v1 "kubevirt.io/kubevirt/pkg/api/v1"
-	"kubevirt.io/kubevirt/pkg/kubecli"
+	v1 "kubevirt.io/api/core/v1"
+	"kubevirt.io/client-go/kubecli"
+
+	"kubevirt.io/kubevirt/pkg/libvmi"
+
 	"kubevirt.io/kubevirt/tests"
+	"kubevirt.io/kubevirt/tests/console"
+	"kubevirt.io/kubevirt/tests/framework/kubevirt"
+	"kubevirt.io/kubevirt/tests/libvmifact"
 )
 
-var _ = Describe("Health Monitoring", func() {
+var _ = Describe("[sig-compute]Health Monitoring", decorators.SigCompute, func() {
 
-	flag.Parse()
-
-	virtClient, err := kubecli.GetKubevirtClient()
-	tests.PanicOnError(err)
-
-	launchVMI := func(vmi *v1.VirtualMachineInstance) {
-		By("Starting a VirtualMachineInstance")
-		obj, err := virtClient.RestClient().Post().Resource("virtualmachineinstances").Namespace(tests.NamespaceTestDefault).Body(vmi).Do().Get()
-		Expect(err).To(BeNil())
-
-		tests.WaitForSuccessfulVMIStart(obj)
-	}
+	var virtClient kubecli.KubevirtClient
 
 	BeforeEach(func() {
-		tests.BeforeTestCleanup()
+		virtClient = kubevirt.Client()
 	})
 
 	Describe("A VirtualMachineInstance with a watchdog device", func() {
-		It("should be shut down when the watchdog expires", func() {
-			vmi := tests.NewRandomVMIWithWatchdog()
-			Expect(err).ToNot(HaveOccurred())
-			launchVMI(vmi)
+		It("[test_id:4641]should be shut down when the watchdog expires", func() {
+			vmi := tests.RunVMIAndExpectLaunch(
+				libvmifact.NewAlpine(libvmi.WithWatchdog(v1.WatchdogActionPoweroff)), 360)
 
 			By("Expecting the VirtualMachineInstance console")
-			expecter, err := tests.LoggedInAlpineExpecter(vmi)
-			Expect(err).ToNot(HaveOccurred())
-			defer expecter.Close()
+			Expect(console.LoginToAlpine(vmi)).To(Succeed())
 
 			By("Killing the watchdog device")
-			_, err = expecter.ExpectBatch([]expect.Batcher{
+			Expect(console.SafeExpectBatch(vmi, []expect.Batcher{
 				&expect.BSnd{S: "watchdog -t 2000ms -T 4000ms /dev/watchdog && sleep 5 && killall -9 watchdog\n"},
-				&expect.BExp{R: "#"},
+				&expect.BExp{R: console.PromptExpression},
 				&expect.BSnd{S: "echo $?\n"},
-				&expect.BExp{R: "0"},
-			}, 250*time.Second)
-			Expect(err).ToNot(HaveOccurred())
+				&expect.BExp{R: console.RetValue("0")},
+			}, 250)).To(Succeed())
 
 			namespace := vmi.ObjectMeta.Namespace
 			name := vmi.ObjectMeta.Name
 
 			By("Checking that the VirtualMachineInstance has Failed status")
 			Eventually(func() v1.VirtualMachineInstancePhase {
-				startedVMI, err := virtClient.VirtualMachineInstance(namespace).Get(name, &metav1.GetOptions{})
+				startedVMI, err := virtClient.VirtualMachineInstance(namespace).Get(context.Background(), name, metav1.GetOptions{})
 
 				Expect(err).ToNot(HaveOccurred())
 				return startedVMI.Status.Phase

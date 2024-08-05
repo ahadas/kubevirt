@@ -1,14 +1,16 @@
 package certificates
 
 import (
-	"k8s.io/client-go/util/cert"
+	"time"
+
 	"k8s.io/client-go/util/certificate"
 
 	"kubevirt.io/kubevirt/pkg/certificates/triple"
+	"kubevirt.io/kubevirt/pkg/certificates/triple/cert"
 )
 
 func GenerateSelfSignedCert(certsDirectory string, name string, namespace string) (certificate.FileStore, error) {
-	caKeyPair, _ := triple.NewCA("kubevirt.io")
+	caKeyPair, _ := triple.NewCA("kubevirt.io", time.Hour*24*7)
 	keyPair, _ := triple.NewServerKeyPair(
 		caKeyPair,
 		name+"."+namespace+".pod.cluster.local",
@@ -17,6 +19,7 @@ func GenerateSelfSignedCert(certsDirectory string, name string, namespace string
 		"cluster.local",
 		nil,
 		nil,
+		time.Hour*24,
 	)
 
 	store, err := certificate.NewFileStore(name, certsDirectory, certsDirectory, "", "")

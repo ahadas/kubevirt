@@ -6,18 +6,16 @@ go_library(
     importpath = "kubevirt.io/kubevirt/cmd/virt-controller",
     visibility = ["//visibility:private"],
     deps = [
-        "//pkg/monitoring/client/prometheus:go_default_library",
-        "//pkg/monitoring/reflector/prometheus:go_default_library",
-        "//pkg/monitoring/workqueue/prometheus:go_default_library",
         "//pkg/virt-controller/watch:go_default_library",
     ],
 )
 
-load("//pkg/version:def.bzl", "version_x_defs")
+load("//vendor/kubevirt.io/client-go/version:def.bzl", "version_x_defs")
 
 go_binary(
     name = "virt-controller",
     embed = [":go_default_library"],
+    static = "on",
     visibility = ["//visibility:public"],
     x_defs = version_x_defs(),
 )
@@ -36,6 +34,11 @@ container_image(
 
 container_image(
     name = "virt-controller-image",
+    architecture = select({
+        "@io_bazel_rules_go//go/platform:linux_arm64": "arm64",
+        "@io_bazel_rules_go//go/platform:linux_s390x": "s390x",
+        "//conditions:default": "amd64",
+    }),
     base = ":version-container",
     directory = "/usr/bin/",
     entrypoint = ["/usr/bin/virt-controller"],

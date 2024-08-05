@@ -5,7 +5,7 @@
 KubeVirt in combination with use-cases like the cluster-autoscaler can be used
 to scale and provision vm pools. With the VirtualMachineInstanceReplicaSet and
 cloud-init stateless pools can be instantiated and provisioned.
-Many of the used cloud images for these use-cases are bootet with small disks
+Many of the used cloud images for these use-cases are booted with small disks
 with no additional free space, and/or run in read-only mode. A common pattern
 to store temporary data which should survive restarts or temporary data which
 is too big to fit in memory on temporary disks. The `emptyDir` in k8s provides
@@ -21,7 +21,7 @@ A new volume type `emptyDisk` is introduced. The only parameter it supports is
 to make sure that the kubelet can take care of clean-up and that
 `ephemeral-store` resource definitions apply to the `emptyDisks` too.
 
-The definition look like this:
+The definition looks like this:
 
 
 ```golang

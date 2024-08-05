@@ -20,47 +20,40 @@
 package ephemeraldisk
 
 import (
-	"io/ioutil"
+	"errors"
+	"fmt"
 	"os"
-	"os/exec"
-	"os/user"
 	"path/filepath"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	k8sv1 "k8s.io/api/core/v1"
 
-	v1 "kubevirt.io/kubevirt/pkg/api/v1"
+	api2 "kubevirt.io/client-go/api"
+
+	v1 "kubevirt.io/api/core/v1"
+
+	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/api"
 )
 
 var _ = Describe("ContainerDisk", func() {
 	var imageTempDirPath string
-	var backingTempDirPath string
+	var pvcBaseTempDirPath string
+	var blockDevBaseDir string
+	var creator *ephemeralDiskCreator
 
-	owner, err := user.Current()
-	if err != nil {
-		panic(err)
+	createBackingImageForPVC := func(volumeName string, isBlock bool) error {
+		if err := os.Mkdir(filepath.Join(pvcBaseTempDirPath, volumeName), 0755); err != nil {
+			return err
+		}
+		f, err := os.Create(creator.getBackingFilePath(volumeName, isBlock))
+		if err != nil {
+			return err
+		}
+		return f.Close()
 	}
 
-	createBackingImageForPVC := func(volumeName string) {
-		// Note that this is within our tmpdir -- cleanup is done after tests.
-		os.Mkdir(filepath.Join(pvcBaseDir, volumeName), 0755)
-
-		var args []string
-
-		args = append(args, "create")
-		args = append(args, "-f")
-		args = append(args, "raw")
-		args = append(args, getBackingFilePath(volumeName))
-		args = append(args, "1K")
-
-		// Requires qemu-img binary to be present.
-		cmd := exec.Command("qemu-img", args...)
-		err := cmd.Run()
-		Expect(err).NotTo(HaveOccurred())
-	}
-
-	AppendEphemeralPVC := func(vmi *v1.VirtualMachineInstance, diskName string, claimName string) {
+	AppendEphemeralPVC := func(vmi *v1.VirtualMachineInstance, diskName string, claimName string, backingDiskIsblock bool) {
 		vmi.Spec.Domain.Devices.Disks = append(vmi.Spec.Domain.Devices.Disks, v1.Disk{
 			Name: diskName,
 			DiskDevice: v1.DiskDevice{
@@ -79,47 +72,46 @@ var _ = Describe("ContainerDisk", func() {
 		})
 
 		By("Creating a backing image for the PVC")
-		createBackingImageForPVC(diskName)
+		Expect(createBackingImageForPVC(diskName, backingDiskIsblock)).To(Succeed())
 
 		// Test the test infra itself: make sure that the backing file has been created.
-		_, err := os.Stat(filepath.Join(pvcBaseDir, diskName, "disk.img"))
+		var err error
+		if backingDiskIsblock {
+			_, err = os.Stat(filepath.Join(blockDevBaseDir, diskName))
+		} else {
+			_, err = os.Stat(filepath.Join(pvcBaseTempDirPath, diskName, "disk.img"))
+		}
 		Expect(err).NotTo(HaveOccurred())
 	}
 
 	BeforeEach(func() {
-		SetLocalDataOwner(owner.Username)
+		imageTempDirPath = GinkgoT().TempDir()
+		pvcBaseTempDirPath = GinkgoT().TempDir()
+		blockDevBaseDir = GinkgoT().TempDir()
 
-		backingTempDirPath, err := ioutil.TempDir("", "ephemeraldisk-backing")
-		Expect(err).NotTo(HaveOccurred())
-		err = setBackingDirectory(backingTempDirPath)
-		Expect(err).NotTo(HaveOccurred())
-
-		imageTempDirPath, err = ioutil.TempDir("", "ephemeraldisk-image")
-		Expect(err).NotTo(HaveOccurred())
-		err = SetLocalDirectory(imageTempDirPath)
-		Expect(err).NotTo(HaveOccurred())
-	})
-
-	AfterEach(func() {
-		os.RemoveAll(imageTempDirPath)
-		os.RemoveAll(backingTempDirPath)
+		creator = &ephemeralDiskCreator{
+			mountBaseDir:    imageTempDirPath,
+			pvcBaseDir:      pvcBaseTempDirPath,
+			blockDevBaseDir: blockDevBaseDir,
+			discCreateFunc:  fakeCreateBackingDisk,
+		}
 	})
 
 	Describe("ephemeral-backed PVC", func() {
 		Context("With single ephemeral volume", func() {
 			It("Should create VirtualMachineInstance's ephemeral image", func() {
 				By("Creating a minimal VirtualMachineInstance object")
-				vmi := v1.NewMinimalVMI("fake-vmi")
+				vmi := api2.NewMinimalVMI("fake-vmi")
 
 				By("Adding a single ephemeral-backed PVC to the VirtualMachineInstance")
-				AppendEphemeralPVC(vmi, "fake-disk", "fake-pvc")
+				AppendEphemeralPVC(vmi, "fake-disk", "fake-pvc", false)
 
 				By("Creating VirtualMachineInstance disk image that corresponds to the VMIs PVC")
-				err := CreateEphemeralImages(vmi)
+				err := creator.CreateEphemeralImages(vmi, &api.Domain{})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Now we can test the behavior - the COW image must exist.
-				_, err = os.Stat(filepath.Join(mountBaseDir, "fake-disk", "disk.qcow2"))
+				_, err = os.Stat(filepath.Join(creator.mountBaseDir, "fake-disk", "disk.qcow2"))
 				Expect(err).NotTo(HaveOccurred())
 			})
 		})
@@ -127,33 +119,83 @@ var _ = Describe("ContainerDisk", func() {
 		Context("With multiple ephemeral volumes", func() {
 			It("Should create VirtualMachineInstance's ephemeral images", func() {
 				By("Creating a minimal VirtualMachineInstance object")
-				vmi := v1.NewMinimalVMI("fake-vmi")
+				vmi := api2.NewMinimalVMI("fake-vmi")
 
 				By("Adding multiple ephemeral-backed PVCs to the VirtualMachineInstance")
-				AppendEphemeralPVC(vmi, "fake-disk1", "fake-pvc1")
-				AppendEphemeralPVC(vmi, "fake-disk2", "fake-pvc2")
-				AppendEphemeralPVC(vmi, "fake-disk3", "fake-pvc3")
+				AppendEphemeralPVC(vmi, "fake-disk1", "fake-pvc1", false)
+				AppendEphemeralPVC(vmi, "fake-disk2", "fake-pvc2", false)
+				AppendEphemeralPVC(vmi, "fake-disk3", "fake-pvc3", false)
 
 				By("Creating VirtualMachineInstance disk image that corresponds to the VMIs PVC")
-				err := CreateEphemeralImages(vmi)
+				err := creator.CreateEphemeralImages(vmi, &api.Domain{})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Now we can test the behavior - the COW image must exist.
-				_, err = os.Stat(filepath.Join(mountBaseDir, "fake-disk1", "disk.qcow2"))
+				_, err = os.Stat(filepath.Join(creator.mountBaseDir, "fake-disk1", "disk.qcow2"))
 				Expect(err).NotTo(HaveOccurred())
-				_, err = os.Stat(filepath.Join(mountBaseDir, "fake-disk2", "disk.qcow2"))
+				_, err = os.Stat(filepath.Join(creator.mountBaseDir, "fake-disk2", "disk.qcow2"))
 				Expect(err).NotTo(HaveOccurred())
-				_, err = os.Stat(filepath.Join(mountBaseDir, "fake-disk3", "disk.qcow2"))
+				_, err = os.Stat(filepath.Join(creator.mountBaseDir, "fake-disk3", "disk.qcow2"))
 				Expect(err).NotTo(HaveOccurred())
 			})
 			It("Should create ephemeral images in an idempotent way", func() {
-				vmi := v1.NewMinimalVMI("fake-vmi")
-				AppendEphemeralPVC(vmi, "fake-disk1", "fake-pvc1")
-				err := CreateEphemeralImages(vmi)
+				vmi := api2.NewMinimalVMI("fake-vmi")
+				AppendEphemeralPVC(vmi, "fake-disk1", "fake-pvc1", false)
+				err := creator.CreateEphemeralImages(vmi, &api.Domain{})
 				Expect(err).NotTo(HaveOccurred())
-				err = CreateEphemeralImages(vmi)
+				err = creator.CreateEphemeralImages(vmi, &api.Domain{})
+				Expect(err).NotTo(HaveOccurred())
+			})
+		})
+
+		Context("With a block pvc backed ephemeral volume", func() {
+			It("Should create VirtualMachineInstance's ephemeral image", func() {
+				By("Creating a minimal VirtualMachineInstance object")
+				vmi := api2.NewMinimalVMI("fake-vmi")
+
+				By("Adding a single ephemeral-backed PVC to the VirtualMachineInstance")
+				AppendEphemeralPVC(vmi, "fake-disk", "fake-pvc", true)
+
+				By("Creating VirtualMachineInstance disk image that corresponds to the VMIs PVC")
+				err := creator.CreateEphemeralImages(vmi, &api.Domain{
+					Spec: api.DomainSpec{
+						Devices: api.Devices{
+							Disks: []api.Disk{
+								{
+									BackingStore: &api.BackingStore{
+										Type: "block",
+										Source: &api.DiskSource{
+											Dev:  filepath.Join(creator.blockDevBaseDir, "fake-disk"),
+											Name: "fake-disk",
+										},
+									},
+								},
+							},
+						},
+					},
+				})
+				Expect(err).NotTo(HaveOccurred())
+
+				// Now we can test the behavior - the COW image must exist.
+				_, err = os.Stat(filepath.Join(creator.mountBaseDir, "fake-disk", "disk.qcow2"))
 				Expect(err).NotTo(HaveOccurred())
 			})
 		})
 	})
 })
+
+func fakeCreateBackingDisk(backingFile string, backingFormat string, imagePath string) ([]byte, error) {
+	if backingFormat != "raw" {
+		return nil, fmt.Errorf("wrong backing format")
+	}
+	_, err := os.Stat(backingFile)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	f, err := os.Create(imagePath)
+	if err != nil {
+		return nil, err
+	}
+	err = f.Close()
+	return nil, err
+}

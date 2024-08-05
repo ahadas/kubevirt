@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
- * Copyright 2017, 2018 Red Hat, Inc.
+ * Copyright 2017 - 2019 Red Hat, Inc.
  *
  */
 
@@ -26,12 +26,15 @@ import (
 	"os/signal"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/spf13/cobra"
-	"golang.org/x/crypto/ssh/terminal"
 	"k8s.io/client-go/tools/clientcmd"
 
-	"kubevirt.io/kubevirt/pkg/kubecli"
+	kvcorev1 "kubevirt.io/client-go/generated/kubevirt/clientset/versioned/typed/core/v1"
+	"kubevirt.io/client-go/kubecli"
+
 	"kubevirt.io/kubevirt/pkg/virtctl/templates"
+	"kubevirt.io/kubevirt/pkg/virtctl/utils"
 )
 
 var timeout int
@@ -41,10 +44,10 @@ func NewCommand(clientConfig clientcmd.ClientConfig) *cobra.Command {
 		Use:     "console (VMI)",
 		Short:   "Connect to a console of a virtual machine instance.",
 		Example: usage(),
-		Args:    cobra.ExactArgs(1),
+		Args:    templates.ExactArgs("console", 1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c := Console{clientConfig: clientConfig}
-			return c.Run(cmd, args)
+			return c.Run(args)
 		},
 	}
 
@@ -59,14 +62,14 @@ type Console struct {
 
 func usage() string {
 	usage := `  # Connect to the console on VirtualMachineInstance 'myvmi':
-  virtctl console myvmi
+  {{ProgramName}} console myvmi
   # Configure one minute timeout (default 5 minutes)
-  virtctl console --timeout=1 myvmi`
+  {{ProgramName}} console --timeout=1 myvmi`
 
 	return usage
 }
 
-func (c *Console) Run(cmd *cobra.Command, args []string) error {
+func (c *Console) Run(args []string) error {
 	namespace, _, err := c.clientConfig.Namespace()
 	if err != nil {
 		return err
@@ -84,26 +87,21 @@ func (c *Console) Run(cmd *cobra.Command, args []string) error {
 
 	// in -> stdinWriter | stdinReader -> console
 	// out <- stdoutReader | stdoutWriter <- console
-
-	resChan := make(chan error)
-	stopChan := make(chan struct{}, 1)
-	writeStop := make(chan error)
-	readStop := make(chan error)
-
 	// Wait until the virtual machine is in running phase, user interrupt or timeout
+	resChan := make(chan error)
 	runningChan := make(chan error)
 	waitInterrupt := make(chan os.Signal, 1)
 	signal.Notify(waitInterrupt, os.Interrupt)
 
 	go func() {
-		con, err := virtCli.VirtualMachineInstance(namespace).SerialConsole(vmi, time.Duration(timeout)*time.Minute)
+		con, err := virtCli.VirtualMachineInstance(namespace).SerialConsole(vmi, &kvcorev1.SerialConsoleOptions{ConnectionTimeout: time.Duration(timeout) * time.Minute})
 		runningChan <- err
 
 		if err != nil {
 			return
 		}
 
-		resChan <- con.Stream(kubecli.StreamOptions{
+		resChan <- con.Stream(kvcorev1.StreamOptions{
 			In:  stdinReader,
 			Out: stdoutWriter,
 		})
@@ -119,64 +117,16 @@ func (c *Console) Run(cmd *cobra.Command, args []string) error {
 			return err
 		}
 	}
+	err = utils.AttachConsole(stdinReader, stdoutReader, stdinWriter, stdoutWriter,
+		fmt.Sprint("Successfully connected to ", vmi, " console. The escape sequence is ^]\n"),
+		resChan)
 
-	state, err := terminal.MakeRaw(int(os.Stdin.Fd()))
 	if err != nil {
-		return fmt.Errorf("Make raw terminal failed: %s", err)
-	}
-	fmt.Fprint(os.Stderr, "Successfully connected to ", vmi, " console. The escape sequence is ^]\n")
-
-	in := os.Stdin
-	out := os.Stdout
-
-	go func() {
-		interrupt := make(chan os.Signal, 1)
-		signal.Notify(interrupt, os.Interrupt)
-		<-interrupt
-		close(stopChan)
-	}()
-
-	go func() {
-		_, err := io.Copy(out, stdoutReader)
-		readStop <- err
-	}()
-
-	go func() {
-		defer close(writeStop)
-		buf := make([]byte, 1024, 1024)
-		for {
-			// reading from stdin
-			n, err := in.Read(buf)
-			if err != nil && err != io.EOF {
-				writeStop <- err
-				return
-			}
-			if n == 0 && err == io.EOF {
-				return
-			}
-
-			// the escape sequence
-			if buf[0] == 29 {
-				return
-			}
-			// Writing out to the console connection
-			_, err = stdinWriter.Write(buf[0:n])
-			if err == io.EOF {
-				return
-			}
+		if e, ok := err.(*websocket.CloseError); ok && e.Code == websocket.CloseAbnormalClosure {
+			fmt.Fprint(os.Stderr, "\nYou were disconnected from the console. This has one of the following reasons:"+
+				"\n - another user connected to the console of the target vm"+
+				"\n - network issues\n")
 		}
-	}()
-
-	select {
-	case <-stopChan:
-	case err = <-readStop:
-	case err = <-writeStop:
-	case err = <-resChan:
-	}
-
-	terminal.Restore(int(os.Stdin.Fd()), state)
-
-	if err != nil {
 		return err
 	}
 	return nil

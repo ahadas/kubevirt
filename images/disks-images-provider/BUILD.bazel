@@ -2,32 +2,19 @@ load(
     "@io_bazel_rules_docker//container:container.bzl",
     "container_image",
 )
-load("@bazel_tools//tools/build_defs/pkg:pkg.bzl", "pkg_tar")
-load("@io_bazel_rules_container_rpm//rpm:rpm.bzl", "rpm_image")
-
-rpm_image(
-    name = "qemu-img-image",
-    base = "@fedora//image",
-    rpms = [
-        "@qemu-img//file",
-        "@capstone//file",
-        "@libaio//file",
-        "@libstdc//file",
-    ],
-)
+load("@rules_pkg//:pkg.bzl", "pkg_tar")
 
 genrule(
     name = "alpine-img",
-    srcs = ["@alpine_image//file"],
+    srcs = select({
+        "@io_bazel_rules_go//go/platform:linux_arm64": ["@alpine_image_aarch64//file"],
+        "//conditions:default": ["@alpine_image//file"],
+    }),
     outs = ["images/alpine/disk.img"],
-    cmd = "mkdir -p images/alpine && cat $(location @alpine_image//file) > $@",
-)
-
-genrule(
-    name = "cirros-img",
-    srcs = ["@cirros_image//file"],
-    outs = ["images/cirros/disk.img"],
-    cmd = "mkdir -p images/cirros && cat $(location @cirros_image//file) > $@",
+    cmd = select({
+        "@io_bazel_rules_go//go/platform:linux_arm64": "mkdir -p images/alpine && cat $(location @alpine_image_aarch64//file) > $@",
+        "//conditions:default": "mkdir -p images/alpine && cat $(location @alpine_image//file) > $@",
+    }),
 )
 
 genrule(
@@ -46,14 +33,6 @@ pkg_tar(
 )
 
 pkg_tar(
-    name = "cirros-tar",
-    srcs = [
-        ":cirros-img",
-    ],
-    package_dir = "images/cirros",
-)
-
-pkg_tar(
     name = "custom-tar",
     srcs = [
         ":custom-img",
@@ -63,13 +42,16 @@ pkg_tar(
 
 container_image(
     name = "disks-images-provider-image",
-    base = ":qemu-img-image",
+    architecture = select({
+        "@io_bazel_rules_go//go/platform:linux_arm64": "arm64",
+        "//conditions:default": "amd64",
+    }),
+    base = "//images:kubevirt-testing-base",
     directory = "/",
     entrypoint = ["/entrypoint.sh"],
     files = ["entrypoint.sh"],
     tars = [
         ":alpine-tar",
-        ":cirros-tar",
         ":custom-tar",
     ],
     visibility = ["//visibility:public"],

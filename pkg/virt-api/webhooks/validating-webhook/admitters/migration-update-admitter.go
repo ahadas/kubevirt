@@ -20,32 +20,60 @@
 package admitters
 
 import (
-	"reflect"
-
-	"k8s.io/api/admission/v1beta1"
+	admissionv1 "k8s.io/api/admission/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	v1 "kubevirt.io/kubevirt/pkg/api/v1"
-	"kubevirt.io/kubevirt/pkg/virt-api/webhooks"
+	v1 "kubevirt.io/api/core/v1"
+
+	webhookutils "kubevirt.io/kubevirt/pkg/util/webhooks"
 )
 
 type MigrationUpdateAdmitter struct {
 }
 
-func (admitter *MigrationUpdateAdmitter) Admit(ar *v1beta1.AdmissionReview) *v1beta1.AdmissionResponse {
+func ensureSelectorLabelSafe(newMigration *v1.VirtualMachineInstanceMigration, oldMigration *v1.VirtualMachineInstanceMigration) []metav1.StatusCause {
+	if newMigration.Status.Phase != v1.MigrationSucceeded && newMigration.Status.Phase != v1.MigrationFailed && oldMigration.Labels != nil {
+		oldLabel, oldExists := oldMigration.Labels[v1.MigrationSelectorLabel]
+		if newMigration.Labels == nil {
+			if oldExists {
+				return []metav1.StatusCause{
+					{
+						Type:    metav1.CauseTypeFieldValueNotSupported,
+						Message: "selector label can't be removed from an in-flight migration",
+					},
+				}
+			}
+		} else {
+			newLabel, newExists := newMigration.Labels[v1.MigrationSelectorLabel]
+			if oldExists && (!newExists || newLabel != oldLabel) {
+				return []metav1.StatusCause{
+					{
+						Type:    metav1.CauseTypeFieldValueNotSupported,
+						Message: "selector label can't be modified on an in-flight migration",
+					},
+				}
+			}
+		}
+	}
+
+	return []metav1.StatusCause{}
+}
+
+func (admitter *MigrationUpdateAdmitter) Admit(ar *admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
 	// Get new migration from admission response
 	newMigration, oldMigration, err := getAdmissionReviewMigration(ar)
 	if err != nil {
-		return webhooks.ToAdmissionResponseError(err)
+		return webhookutils.ToAdmissionResponseError(err)
 	}
 
-	if resp := webhooks.ValidateSchema(v1.VirtualMachineInstanceMigrationGroupVersionKind, ar.Request.Object.Raw); resp != nil {
+	if resp := webhookutils.ValidateSchema(v1.VirtualMachineInstanceMigrationGroupVersionKind, ar.Request.Object.Raw); resp != nil {
 		return resp
 	}
 
 	// Reject Migration update if spec changed
-	if !reflect.DeepEqual(newMigration.Spec, oldMigration.Spec) {
-		return webhooks.ToAdmissionResponse([]metav1.StatusCause{
+	if !equality.Semantic.DeepEqual(newMigration.Spec, oldMigration.Spec) {
+		return webhookutils.ToAdmissionResponse([]metav1.StatusCause{
 			{
 				Type:    metav1.CauseTypeFieldValueNotSupported,
 				Message: "update of Migration object's spec is restricted",
@@ -53,7 +81,13 @@ func (admitter *MigrationUpdateAdmitter) Admit(ar *v1beta1.AdmissionReview) *v1b
 		})
 	}
 
-	reviewResponse := v1beta1.AdmissionResponse{}
+	// Reject Migration update if selector label changed on an in-flight migration
+	causes := ensureSelectorLabelSafe(newMigration, oldMigration)
+	if len(causes) > 0 {
+		return webhookutils.ToAdmissionResponse(causes)
+	}
+
+	reviewResponse := admissionv1.AdmissionResponse{}
 	reviewResponse.Allowed = true
 	return &reviewResponse
 }

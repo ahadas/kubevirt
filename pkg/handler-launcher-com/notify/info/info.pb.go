@@ -5,20 +5,25 @@
 Package info is a generated protocol buffer package.
 
 It is generated from these files:
+
 	pkg/handler-launcher-com/notify/info/info.proto
 
 It has these top-level messages:
+
 	NotifyInfoRequest
 	NotifyInfoResponse
 */
 package info
 
-import proto "github.com/golang/protobuf/proto"
-import fmt "fmt"
-import math "math"
-
 import (
+	fmt "fmt"
+
+	proto "github.com/golang/protobuf/proto"
+
+	math "math"
+
 	context "golang.org/x/net/context"
+
 	grpc "google.golang.org/grpc"
 )
 

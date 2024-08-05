@@ -25,8 +25,8 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	k8sv1 "k8s.io/api/core/v1"
 
-	v1 "kubevirt.io/kubevirt/pkg/api/v1"
-	"kubevirt.io/kubevirt/pkg/log"
+	v1 "kubevirt.io/api/core/v1"
+	"kubevirt.io/client-go/log"
 )
 
 func DaemonsetIsReady(kv *v1.KubeVirt, daemonset *appsv1.DaemonSet, stores Stores) bool {
@@ -59,23 +59,25 @@ func DaemonsetIsReady(kv *v1.KubeVirt, daemonset *appsv1.DaemonSet, stores Store
 				continue
 			}
 
-			if !podIsUpToDate(pod, kv) {
+			if !PodIsUpToDate(pod, kv) {
 				log.Log.Infof("DaemonSet %v waiting for out of date pods to terminate.", daemonset.Name)
 				return false
 			}
 
-			if podIsReady(pod) {
+			if PodIsReady(pod) {
 				podsReady++
 			}
 		}
 	}
 
 	if podsReady == 0 {
-		log.Log.Infof("DaemonSet %v not ready yet. Waiting on at least one ready pod", daemonset.Name)
+		log.Log.Infof("DaemonSet %v not ready yet. Waiting for all pods to be ready", daemonset.Name)
 		return false
 	}
 
-	return true
+	// Misscheduled but up to date daemonset pods will not be evicted unless manually deleted or the daemonset gets updated.
+	// Don't force the Available condition to false or block the upgrade on up-to-date misscheduled pods.
+	return podsReady >= daemonset.Status.DesiredNumberScheduled
 }
 
 func DeploymentIsReady(kv *v1.KubeVirt, deployment *appsv1.Deployment, stores Stores) bool {
@@ -105,12 +107,12 @@ func DeploymentIsReady(kv *v1.KubeVirt, deployment *appsv1.Deployment, stores St
 				continue
 			}
 
-			if !podIsUpToDate(pod, kv) {
+			if !PodIsUpToDate(pod, kv) {
 				log.Log.Infof("Deployment %v waiting for out of date pods to terminate.", deployment.Name)
 				return false
 			}
 
-			if podIsReady(pod) {
+			if PodIsReady(pod) {
 				podsReady++
 			}
 		}
@@ -123,24 +125,31 @@ func DeploymentIsReady(kv *v1.KubeVirt, deployment *appsv1.Deployment, stores St
 	return true
 }
 
+func DaemonSetIsUpToDate(kv *v1.KubeVirt, daemonSet *appsv1.DaemonSet) bool {
+	version := kv.Status.TargetKubeVirtVersion
+	registry := kv.Status.TargetKubeVirtRegistry
+	id := kv.Status.TargetDeploymentID
+
+	return daemonSet.Annotations[v1.InstallStrategyVersionAnnotation] == version &&
+		daemonSet.Annotations[v1.InstallStrategyRegistryAnnotation] == registry &&
+		daemonSet.Annotations[v1.InstallStrategyIdentifierAnnotation] == id
+}
+
 func podIsRunning(pod *k8sv1.Pod) bool {
 	return pod.Status.Phase == k8sv1.PodRunning
 }
 
 func podHasNamePrefix(pod *k8sv1.Pod, namePrefix string) bool {
-	if strings.Contains(pod.Name, namePrefix) {
-		return true
-	}
-	return false
+	return strings.Contains(pod.Name, namePrefix)
 }
 
-func podIsUpToDate(pod *k8sv1.Pod, kv *v1.KubeVirt) bool {
+func PodIsUpToDate(pod *k8sv1.Pod, kv *v1.KubeVirt) bool {
 	if pod.Annotations == nil {
 		return false
 	}
 
-	imageTag, ok := pod.Annotations[v1.InstallStrategyVersionAnnotation]
-	if !ok || imageTag != kv.Status.TargetKubeVirtVersion {
+	version, ok := pod.Annotations[v1.InstallStrategyVersionAnnotation]
+	if !ok || version != kv.Status.TargetKubeVirtVersion {
 		return false
 	}
 
@@ -148,10 +157,16 @@ func podIsUpToDate(pod *k8sv1.Pod, kv *v1.KubeVirt) bool {
 	if !ok || imageRegistry != kv.Status.TargetKubeVirtRegistry {
 		return false
 	}
+
+	id, ok := pod.Annotations[v1.InstallStrategyIdentifierAnnotation]
+	if !ok || id != kv.Status.TargetDeploymentID {
+		return false
+	}
+
 	return true
 }
 
-func podIsReady(pod *k8sv1.Pod) bool {
+func PodIsReady(pod *k8sv1.Pod) bool {
 	if pod.Status.Phase != k8sv1.PodRunning {
 		return false
 	}
@@ -161,4 +176,19 @@ func podIsReady(pod *k8sv1.Pod) bool {
 		}
 	}
 	return true
+}
+
+func PodIsCrashLooping(pod *k8sv1.Pod) bool {
+	haveContainersCrashed := func(cs []k8sv1.ContainerStatus) bool {
+		for i := range cs {
+			if cs[i].State.Terminated != nil ||
+				cs[i].LastTerminationState.Terminated != nil ||
+				cs[i].RestartCount > 0 {
+				return true
+			}
+		}
+		return false
+	}
+
+	return haveContainersCrashed(pod.Status.ContainerStatuses)
 }

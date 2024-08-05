@@ -1,33 +1,43 @@
 # Security Policy
 
-## Supported Versions
-
-| Version | Supported          |
-| ------- | ------------------ |
-| master  | Yes                |
-| 0.17    | Yes                |
-| <0.17   | No                 |
-
 ## Reporting a Vulnerability
 
-**Reporting a Potential Security Vulnerability**: If you have discovered
-potential security vulnerability in this project, please send an e-mail to
-secalert@redhat.com. For issues related to Red Hat Products, please visit
-https://access.redhat.com/security/team/contact/.
+The KubeVirt project treats security vulnerabilities seriously, so we
+strive to take action quickly when required.
 
-It is important to include the following details:
-  - The projects and versions affected
-  - Detailed description of the vulnerability
-  - Information on known exploits
+The project requests that security issues be disclosed in a responsible
+manner to allow adequate time to respond.  If a security issue or
+vulnerability has been found, please disclose the details to our
+dedicated email address:
 
-Vulnerability information is extremely sensitive. Please encrypt all security
-vulnerability reports using our *PGP key*
+cncf-kubevirt-security@lists.cncf.io
 
-A member of the Red Hat Product Security Team will review your e-mail and
-contact you to to collaborate on resolving the issue. For more information on
-how Red Hat works to resolve security issues, see: *Vulnerability Handling
-Guidelines*
+Please include as much information as possible with the report. The
+following details assist with analysis efforts:
+  - Description of the vulnerability
+  - Affected component (version, commit, branch etc)
+  - Affected code (file path, line numbers)
+  - Exploit code
 
-PGP Key: https://access.redhat.com/security/team/contact/#contact
+Any confidential information disclosed to the security team will be
+handled appropriately to prevent misuse or accidental disclosure.
 
-Vulnerability Handling Guidelines: https://access.redhat.com/security/team/contact/
+## Security Notices
+
+Security notices will be sent to the kubevirt-dev@googlegroups.com
+mailing list and published to the
+[Security Advisories](https://github.com/kubevirt/kubevirt/security/advisories)
+page.
+
+## Security Team
+
+The security team currently consists of the Maintainers of KubeVirt and is
+supported by security teams of involved vendors.
+
+List of involved vendor security teams:
+- Red Hat <secalert@redhat.com>
+- SUSE <security@suse.de>
+
+## Alternate Reporting Mechanism
+
+If you are unable to report the vulnerability to the dedicated email address, you can use the [GitHub vulnerability report mechanism](https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/privately-reporting-a-security-vulnerability#privately-reporting-a-security-vulnerability). 

@@ -11,11 +11,65 @@ go_library(
     ],
 )
 
-load("//pkg/version:def.bzl", "version_x_defs")
+load("//vendor/kubevirt.io/client-go/version:def.bzl", "version_x_defs")
 
 go_binary(
     name = "virtctl",
     embed = [":go_default_library"],
+    visibility = ["//visibility:public"],
+    x_defs = version_x_defs(),
+)
+
+go_binary(
+    name = "virtctl-amd64",
+    embed = [":go_default_library"],
+    goarch = "amd64",
+    goos = "linux",
+    visibility = ["//visibility:public"],
+    x_defs = version_x_defs(),
+)
+
+go_binary(
+    name = "virtctl-darwin",
+    embed = [":go_default_library"],
+    goarch = "amd64",
+    goos = "darwin",
+    visibility = ["//visibility:public"],
+    x_defs = version_x_defs(),
+)
+
+go_binary(
+    name = "virtctl-windows",
+    embed = [":go_default_library"],
+    goarch = "amd64",
+    goos = "windows",
+    visibility = ["//visibility:public"],
+    x_defs = version_x_defs(),
+)
+
+go_binary(
+    name = "virtctl-arm64",
+    embed = [":go_default_library"],
+    goarch = "arm64",
+    goos = "linux",
+    visibility = ["//visibility:public"],
+    x_defs = version_x_defs(),
+)
+
+go_binary(
+    name = "virtctl-s390x",
+    embed = [":go_default_library"],
+    goarch = "s390x",
+    goos = "linux",
+    visibility = ["//visibility:public"],
+    x_defs = version_x_defs(),
+)
+
+go_binary(
+    name = "virtctl-darwin-arm64",
+    embed = [":go_default_library"],
+    goarch = "arm64",
+    goos = "darwin",
     visibility = ["//visibility:public"],
     x_defs = version_x_defs(),
 )

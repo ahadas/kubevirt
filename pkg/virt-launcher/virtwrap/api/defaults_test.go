@@ -1,29 +1,40 @@
 package api
 
 import (
-	. "github.com/onsi/ginkgo"
+	ginkgo "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
-var _ = Describe("Defaults", func() {
+var _ = ginkgo.Describe("ArchSpecificDefaults", func() {
 
-	It("should set architecture", func() {
+	ginkgo.DescribeTable("should set architecture", func(arch string, targetArch string) {
 		domain := &Domain{}
-		SetDefaults_OSType(&domain.Spec.OS.Type)
-		Expect(domain.Spec.OS.Type.Arch).To(Equal("x86_64"))
-	})
+		NewDefaulter(arch).SetDefaults_OSType(&domain.Spec.OS.Type)
+		Expect(domain.Spec.OS.Type.Arch).To(Equal(targetArch))
+	},
+		ginkgo.Entry("to ppc64le", "ppc64le", "ppc64le"),
+		ginkgo.Entry("to arm64", "arm64", "aarch64"),
+		ginkgo.Entry("to x86_64", "amd64", "x86_64"),
+	)
 
-	It("should set q35 machine type and hvm domain type", func() {
+	ginkgo.DescribeTable("should set machine type and hvm domain type", func(arch string, machineType string) {
 		domain := &Domain{}
-		SetDefaults_OSType(&domain.Spec.OS.Type)
-		Expect(domain.Spec.OS.Type.Machine).To(Equal("q35"))
-		Expect(domain.Spec.OS.Type.OS).To(Equal("hvm"))
-	})
+		NewDefaulter(arch).SetDefaults_OSType(&domain.Spec.OS.Type)
+		Expect(domain.Spec.OS.Type.Machine).To(Equal(machineType))
+	},
+		ginkgo.Entry("to pseries", "ppc64le", "pseries"),
+		ginkgo.Entry("to arm64", "arm64", "virt"),
+		ginkgo.Entry("to q35", "amd64", "q35"),
+	)
 
-	It("should set libvirt namespace and use QEMU as emulator", func() {
+	ginkgo.DescribeTable("should set libvirt namespace and use QEMU as emulator", func(arch string) {
 		domain := &Domain{}
-		SetDefaults_DomainSpec(&domain.Spec)
+		NewDefaulter(arch).SetDefaults_DomainSpec(&domain.Spec)
 		Expect(domain.Spec.XmlNS).To(Equal("http://libvirt.org/schemas/domain/qemu/1.0"))
 		Expect(domain.Spec.Type).To(Equal("kvm"))
-	})
+	},
+		ginkgo.Entry("to pseries", "ppc64le"),
+		ginkgo.Entry("to virt", "arm64"),
+		ginkgo.Entry("to q35", "amd64"),
+	)
 })

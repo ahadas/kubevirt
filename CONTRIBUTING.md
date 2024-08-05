@@ -32,32 +32,62 @@ If you spot a bug or want to change something pretty simple, just go
 ahead and open an Issue and/or a Pull Request, including your changes
 at [kubevirt/kubevirt](https://github.com/kubevirt/kubevirt).
 
-For bigger changes, please create a tracker Issue, describing what you want to
-do. Then either as the first commit in a Pull Request, or as an independent
-Pull Request, provide an **informal** design proposal of your intended changes.
-The location for such propoals is
-[/docs](docs/) in the KubeVirt
-core repository. Make sure that all your Pull Requests link back to the
-relevant Issues.
+For larger changes that require more planning and discussion, using the KubeVirt
+[design proposal template](https://github.com/kubevirt/community/blob/main/design-proposals/proposal-template.md) is highly encouraged.
+The technical effort for these changes will impact a large section of the
+development community, so they should be communicated widely.  Examples of these types
+of changes:
+- New APIs
+- Architectural changes
+- Code refactors
+- API changes
 
 ### Getting started
 
 To make yourself comfortable with the code, you might want to work on some
-Issues marked with one or more of the following labels
-[beginner](https://github.com/kubevirt/kubevirt/issues?q=is%3Aissue+is%3Aopen+label%3Abeginner),
-[help
-wanted](https://github.com/kubevirt/kubevirt/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22)
-or [bug](https://github.com/kubevirt/kubevirt/labels/bug). Any help is highly
-appreciated.
+Issues marked with one or more of the following labels:
+[good-first-issue](https://github.com/kubevirt/kubevirt/labels/good-first-issue),
+[help-wanted](https://github.com/kubevirt/kubevirt/labels/help-wanted)
+or [kind/bug](https://github.com/kubevirt/kubevirt/labels/kind%2Fbug).
+Any help is highly appreciated.
 
 ### Testing
 
-**Untested features do not exist**. To ensure that what we code really works,
+**Untested features do not exist**. To ensure that what the code really works,
 relevant flows should be covered via unit tests and functional tests. So when
 thinking about a contribution, also think about testability. All tests can be
 run local without the need of CI. Have a look at the
 [Testing](docs/getting-started.md#testing)
 section in the [Developer Guide](docs/getting-started.md).
+
+#### Automated testing of pull requests
+
+Automated testing is triggered on pull requests (PRs) opened by members of the KubeVirt organization, with the exception of _[draft pull requests](CONTRIBUTING.md#consider-opening-your-pull-request-as-draft)_. Pull requests opened by new contributors are initially marked with the label [`needs-ok-to-test`](https://github.com/kubevirt/kubevirt/labels/needs-ok-to-test) and are not automatically tested. Test lanes will be created after a member of the KubeVirt organization adds [`/ok-to-test`](https://prow.ci.kubevirt.io/command-help#ok_to_test) on the PR.
+
+For more information about our CI, please have a look at the [docs](https://github.com/kubevirt/project-infra/tree/main/docs) in the project-infra repository.
+
+#### Consider opening your pull request as draft
+Not all pull requests are ready for review when they are created. This might be because the author wants to initiate a conversation or they might not be entirely sure whether the changes go in the right direction, or even because the changes are not complete.
+
+Please consider creating such PRs as [Draft Pull Requests](https://github.blog/2019-02-14-introducing-draft-pull-requests/). Draft PRs are skipped by CI, which saves CI resources. It also means that reviewers are not automatically assigned and the community will understand that this PR is not yet ready for review.
+
+After you mark your draft pull request as ready for review, reviewers will be assigned and tests will be triggered if the ok-to-test label is present (see [above](CONTRIBUTING.md#automated-testing-of-pull-requests)).
+
+**Note that organization members can always trigger lanes manually by commenting [`/test`](https://prow.ci.kubevirt.io/command-help#test) on the pull request.**
+
+### Contributor compliance with Developer Certificate Of Origin (DCO)
+
+We require every contributor to certify that they are legally permitted to contribute to our project.
+A contributor expresses this by consciously signing their commits, and by this act expressing that
+they comply with the [Developer Certificate Of Origin](https://developercertificate.org/)
+
+A signed commit is a commit where the commit message contains the following content:
+
+```
+Signed-off-by: John Doe <jdoe@example.org>
+```
+
+This can be done by adding [`--signoff`](https://git-scm.com/docs/git-commit#Documentation/git-commit.txt---signoff) to your git command line.
 
 ### Getting your code reviewed/merged
 
@@ -65,18 +95,19 @@ Maintainers are here to help you enabling your use-case in a reasonable amount
 of time. The maintainers will try to review your code and give you productive
 feedback in a reasonable amount of time. However, if you are blocked on a
 review, or your Pull Request does not get the attention you think it deserves,
-reach out for us via Comments in your Issues, or ping us on IRC
-[#kubevirt @irc.freenode.net](https://kiwiirc.com/client/irc.freenode.net/kubevirt).
+reach out for us via Comments in your Issues, or ping us on Slack
+[#kubevirt-dev @ kubernetes.slack.com](https://kubernetes.slack.com/?redir=%2Farchives%2FC0163DT0R8X).
 
-Maintainers are:
+Maintainers are tracked in [OWNERS
+files](https://github.com/kubernetes/test-infra/blob/f7e21a3c18f4f4bbc7ee170675ed53e4544a0632/prow/plugins/approve/approvers/README.md)
+and will be assigned by Prow.
 
- * @admiyo
- * @berrange
- * @davidvossel
- * @fabiand
- * @rmohr
- * @stu-gott
- * @vladikr
+### Becoming a member
+
+Contributors that frequently contribute to the project may ask to join the
+KubeVirt organization.
+
+Please have a look at our [membership guidelines](https://github.com/kubevirt/community/blob/main/membership_policy.md).
 
 ## Projects & Communities
 
@@ -103,7 +134,7 @@ Maintainers are:
   * [Documentation - The Go Programming Language](https://golang.org/doc/)
   * [Getting Started - The Go Programming Language](https://golang.org/doc/install)
 * Patterns
-  * [Introducing Operators: Putting Operational Knowledge into Software](https://coreos.com/blog/introducing-operators.html)
+  * [Introducing Operators: Putting Operational Knowledge into Software](https://web.archive.org/web/20210210032403/https://coreos.com/blog/introducing-operators.html)
   * [Microservices](https://martinfowler.com/articles/microservices.html) nice
     content by Martin Fowler
 * Testing

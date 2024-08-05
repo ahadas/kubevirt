@@ -20,14 +20,17 @@
 package config
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
 
-	. "github.com/onsi/ginkgo"
+	"kubevirt.io/kubevirt/pkg/libvmi"
+
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	v1 "kubevirt.io/kubevirt/pkg/api/v1"
+	"kubevirt.io/client-go/api"
+
+	v1 "kubevirt.io/api/core/v1"
 )
 
 var _ = Describe("Secret", func() {
@@ -35,13 +38,13 @@ var _ = Describe("Secret", func() {
 	BeforeEach(func() {
 		var err error
 
-		SecretSourceDir, err = ioutil.TempDir("", "secret")
+		SecretSourceDir, err = os.MkdirTemp("", "secret")
 		Expect(err).NotTo(HaveOccurred())
 		os.MkdirAll(filepath.Join(SecretSourceDir, "secret-volume", "test-dir"), 0755)
 		os.OpenFile(filepath.Join(SecretSourceDir, "secret-volume", "test-dir", "test-file1"), os.O_RDONLY|os.O_CREATE, 0666)
 		os.OpenFile(filepath.Join(SecretSourceDir, "secret-volume", "test-file2"), os.O_RDONLY|os.O_CREATE, 0666)
 
-		SecretDisksDir, err = ioutil.TempDir("", "secret-disks")
+		SecretDisksDir, err = os.MkdirTemp("", "secret-disks")
 		Expect(err).NotTo(HaveOccurred())
 	})
 
@@ -51,7 +54,18 @@ var _ = Describe("Secret", func() {
 	})
 
 	It("Should create a new secret iso disk", func() {
-		vmi := v1.NewMinimalVMI("fake-vmi")
+		vmi := libvmi.New(
+			libvmi.WithSecretDisk("test-secret", "secret-volume"),
+		)
+
+		err := CreateSecretDisks(vmi, false)
+		Expect(err).NotTo(HaveOccurred())
+		_, err = os.Stat(filepath.Join(SecretDisksDir, "secret-volume.iso"))
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("Should not create a new secret iso disk without a Disk device", func() {
+		vmi := api.NewMinimalVMI("fake-vmi")
 		vmi.Spec.Volumes = append(vmi.Spec.Volumes, v1.Volume{
 			Name: "secret-volume",
 			VolumeSource: v1.VolumeSource{
@@ -61,10 +75,9 @@ var _ = Describe("Secret", func() {
 			},
 		})
 
-		err := CreateSecretDisks(vmi)
+		err := CreateSecretDisks(vmi, false)
 		Expect(err).NotTo(HaveOccurred())
-		_, err = os.Stat(filepath.Join(SecretDisksDir, "secret-volume.iso"))
-		Expect(err).NotTo(HaveOccurred())
+		files, _ := os.ReadDir(SecretDisksDir)
+		Expect(files).To(BeEmpty())
 	})
-
 })

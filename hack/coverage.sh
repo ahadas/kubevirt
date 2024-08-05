@@ -1,9 +1,19 @@
 #!/usr/bin/env bash
-
 set -e
 
-path=${1:-./pkg/...}
-profile=.coverprofile
+source hack/common.sh
+source hack/bootstrap.sh
 
-go test -cover -v -coverprofile=$profile $(go list ${path})
-go tool cover -html=$profile -o coverage.html
+if [ "${CI}" == "true" ]; then
+    cat >>ci.bazelrc <<EOF
+coverage --cache_test_results=no --runs_per_test=1
+EOF
+fi
+
+# TODO: rules_go now supports full bazel lcov integration.
+# Let's move over to that, since the manual coverage merge step is then not needed anymore.
+bazel coverage \
+    --config=${ARCHITECTURE} \
+    --features race \
+    --@io_bazel_rules_go//go/config:cover_format=go_cover \
+    --test_output=errors -- //staging/src/kubevirt.io/client-go/... //pkg/... //cmd/...

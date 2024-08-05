@@ -1,1 +1,1 @@
-VERSION=28-5.1.0
+VERSION=$(date +"%y%m%d%H%M")-$(git rev-parse --short HEAD)

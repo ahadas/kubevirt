@@ -9,6 +9,7 @@ source $(dirname "$0")/../../hack/common.sh
 set -o errexit
 set -o nounset
 set -o pipefail
+set -x
 
 VERSION="$1"
 OUTPUT_FORMAT="$2"
@@ -42,7 +43,7 @@ gradle -b $GRADLE_BUILD_FILE $GRADLE_EXTRA_PARAMS convertSwagger2markup --info
 
 #insert a TOC for top level API objects
 buf="${HEADER}${HEADER} Top Level API Objects\n\n"
-top_level_models=$(grep '&[A-Za-z]*{},' pkg/api/${VERSION}/types.go | sed 's/.*&//;s/{},//')
+top_level_models=$(grep '&[A-Za-z]*{},' staging/src/kubevirt.io/api/core/${VERSION}/types.go | sed 's/.*&//;s/{},//')
 
 # check if the top level models exist in the definitions.$SUFFIX. If they exist,
 # their name will be <version>.<model_name>
@@ -68,6 +69,7 @@ __END__
 if [ "$OUTPUT_FORMAT" = "html" ]; then
     # $$ has special meaning in asciidoc, we need to escape it
     sed -i 's|\$\$|+++$$+++|g' "$WORKDIR/definitions.adoc"
+    sed -i 's|```||g' "$WORKDIR/definitions.adoc"
     sed -i '1 i\:last-update-label!:' "$WORKDIR/"*.adoc
 
     # Determine version of KubeVirt, as a commit hash or tag in case of tagged commit.
@@ -84,13 +86,23 @@ if [ "$OUTPUT_FORMAT" = "html" ]; then
         "$WORKDIR/overview.adoc"
 
     # Generate *.html files from *.adoc
-    gradle -b $GRADLE_BUILD_FILE asciidoctor --info
+    rm -rf "$WORKDIR/html5" && mkdir -p "$WORKDIR/html5"
+    adoc_files=("definitions.adoc" "overview.adoc" "security.adoc" "operations.adoc")
+    for html_file in ${adoc_files[@]}; do
+        asciidoctor \
+            --failure-level INFO \
+            --attribute toc=right \
+            --destination-dir $WORKDIR/html5 \
+            $PWD/$WORKDIR/$html_file
+    done
+
     rm -rf "$WORKDIR/html5/content" && mkdir "$WORKDIR/html5/content" && mv -f "$WORKDIR/html5/"*.html "$WORKDIR/html5/content"
     mv -f "$WORKDIR/html5/content/overview.html" "$WORKDIR/html5/content/index.html"
 elif [ "$OUTPUT_FORMAT" = "markdown" ]; then
     # Generate TOC for definitions & operations as README.md
     cd "$WORKDIR"
     echo "# KubeVirt API Reference" >README.md
+    # reference to master is for an external repo and can't yet be changed
     curl \
         https://raw.githubusercontent.com/ekalinin/github-markdown-toc/master/gh-md-toc |
         bash -s "definitions.md" "operations.md" |

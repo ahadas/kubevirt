@@ -18,7 +18,7 @@ limited to anything that involves persistent connections to a control plane
 component.
 
 1. In-flight migrations will fail. The VMI will remain available, but the
-migration itself will fail due to a severed TLS connection occuring when
+migration itself will fail due to a severed TLS connection occurring when
 virt-handler updates.
 
 2. `virtctl console` and `virtctl vnc` connections will get dropped. This is
@@ -41,7 +41,7 @@ by patching the imageTag value with a new release tag.
 The cluster has the following KubeVirt CR deployed.
 
 ```
-apiVersion: kubevirt.io/v1alpha3
+apiVersion: kubevirt.io/v1
 kind: KubeVirt
 metadata:
   name: kubevirt
@@ -69,7 +69,7 @@ updating KubeVirt as well.
 The cluster has the following KubeVirt CR deployed.
 
 ```
-apiVersion: kubevirt.io/v1alpha3
+apiVersion: kubevirt.io/v1
 kind: KubeVirt
 metadata:
   name: kubevirt
@@ -103,7 +103,7 @@ of new functionality.
 
 ### RBAC 
 
-Since during the update our controll plane will be briefly running both old and
+Since during the update our control plane will be briefly running both old and
 new versions, we have to ensure that RBAC permissions are available that allow
 both the old and new versions of components to operate at the same time.
 
@@ -117,9 +117,15 @@ New APIs are not available until after the entire update process has completed.
 This ensures that a new API object can't be posted to the cluster until every
 component within the cluster is updated to learn of the object.
 
-### API version field changes
+## Notes
 
-Changes to the CRD's version field are not currently supported. We do not intend
-to change the version field of any of our APIs until we have the ability to
-support multiple versions in parallel. 
+### `v1.0.0` Migration To New Storage Versions
 
+With the `v1.0.0` release of KubeVirt the storage version of all core
+`kubevirt.io` APIs will be moving to version `v1`. To
+accommodate the eventual removal of the `v1alpha3` version with KubeVirt >=
+`v1.2.0` it is recommended that operators deploy the
+[`kube-storage-version-migrator`](https://github.com/kubernetes-sigs/kube-storage-version-migrator)
+tool within their environment. This will ensure any existing `v1alpha3`
+stored objects are migrated to `v1` well in advance of the removal of the
+underlying `v1alpha3` version.

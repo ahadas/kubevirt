@@ -11,7 +11,7 @@ go_library(
     deps = [
         "//pkg/virt-launcher/virtwrap/stats:go_default_library",
         "//vendor/github.com/golang/mock/gomock:go_default_library",
-        "//vendor/github.com/libvirt/libvirt-go:go_default_library",
+        "//vendor/libvirt.org/go/libvirt:go_default_library",
     ],
 )
 
@@ -21,17 +21,15 @@ go_test(
         "converter_test.go",
         "stats_suite_test.go",
     ],
-    data = [
-        "domstats.json",
-        "domstats_expected.json",
-    ],
     embed = [":go_default_library"],
     deps = [
-        "//pkg/log:go_default_library",
         "//pkg/virt-launcher/virtwrap/stats:go_default_library",
+        "//pkg/virt-launcher/virtwrap/statsconv/util:go_default_library",
+        "//staging/src/kubevirt.io/client-go/testutils:go_default_library",
         "//vendor/github.com/golang/mock/gomock:go_default_library",
-        "//vendor/github.com/libvirt/libvirt-go:go_default_library",
-        "//vendor/github.com/onsi/ginkgo:go_default_library",
+        "//vendor/github.com/onsi/ginkgo/v2:go_default_library",
         "//vendor/github.com/onsi/gomega:go_default_library",
+        "//vendor/k8s.io/apimachinery/pkg/api/equality:go_default_library",
+        "//vendor/libvirt.org/go/libvirt:go_default_library",
     ],
 )

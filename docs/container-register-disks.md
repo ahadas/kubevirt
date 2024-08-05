@@ -62,8 +62,8 @@ device consumable by libvirt.
 Example:
 ```
 cat << END > Dockerfile
-FROM kubevirt/container-disk-v1alpha
-ADD fedora25.qcow2 /disk
+FROM scratch
+ADD fedora25.qcow2 /disk/
 END
 docker build -t vmdisks/fedora25:latest .
 docker push vmdisks/fedora25:latest

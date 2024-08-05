@@ -5,21 +5,26 @@
 Package v1 is a generated protocol buffer package.
 
 It is generated from these files:
+
 	pkg/handler-launcher-com/notify/v1/notify.proto
 
 It has these top-level messages:
+
 	DomainEventRequest
 	K8SEventRequest
 	Response
 */
 package v1
 
-import proto "github.com/golang/protobuf/proto"
-import fmt "fmt"
-import math "math"
-
 import (
+	fmt "fmt"
+
+	proto "github.com/golang/protobuf/proto"
+
+	math "math"
+
 	context "golang.org/x/net/context"
+
 	grpc "google.golang.org/grpc"
 )
 

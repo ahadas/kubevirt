@@ -20,44 +20,62 @@
 package virt_api
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"net/http"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
+	"time"
 
-	"github.com/emicklei/go-restful"
-	restfulspec "github.com/emicklei/go-restful-openapi"
-	"github.com/go-openapi/spec"
+	builderv3 "k8s.io/kube-openapi/pkg/builder3"
+	"k8s.io/kube-openapi/pkg/common/restfuladapter"
+	"k8s.io/kube-openapi/pkg/validation/spec"
+
+	kvtls "kubevirt.io/kubevirt/pkg/util/tls"
+
+	restful "github.com/emicklei/go-restful/v3"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	flag "github.com/spf13/pflag"
-	admissionregistrationv1beta1 "k8s.io/api/admissionregistration/v1beta1"
-	k8sv1 "k8s.io/api/core/v1"
-	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/util/cert"
-	apiregistrationv1beta1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1beta1"
+	certificate2 "k8s.io/client-go/util/certificate"
+	"k8s.io/client-go/util/flowcontrol"
 	aggregatorclient "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset"
 
-	v1 "kubevirt.io/kubevirt/pkg/api/v1"
-	"kubevirt.io/kubevirt/pkg/certificates/triple"
+	"kubevirt.io/kubevirt/pkg/util/ratelimiter"
+
+	v1 "kubevirt.io/api/core/v1"
+	"kubevirt.io/client-go/kubecli"
+	"kubevirt.io/client-go/log"
+	clientutil "kubevirt.io/client-go/util"
+	virtversion "kubevirt.io/client-go/version"
+
+	v12 "kubevirt.io/client-go/api"
+
+	"kubevirt.io/kubevirt/pkg/certificates/bootstrap"
 	"kubevirt.io/kubevirt/pkg/controller"
 	"kubevirt.io/kubevirt/pkg/healthz"
-	"kubevirt.io/kubevirt/pkg/kubecli"
-	"kubevirt.io/kubevirt/pkg/log"
+	clientmetrics "kubevirt.io/kubevirt/pkg/monitoring/metrics/common/client"
+	metrics "kubevirt.io/kubevirt/pkg/monitoring/metrics/virt-api"
+	"kubevirt.io/kubevirt/pkg/monitoring/profiler"
+	mime "kubevirt.io/kubevirt/pkg/rest"
 	"kubevirt.io/kubevirt/pkg/rest/filter"
 	"kubevirt.io/kubevirt/pkg/service"
 	"kubevirt.io/kubevirt/pkg/util"
 	"kubevirt.io/kubevirt/pkg/util/openapi"
-	"kubevirt.io/kubevirt/pkg/version"
+	"kubevirt.io/kubevirt/pkg/virt-api/definitions"
 	"kubevirt.io/kubevirt/pkg/virt-api/rest"
 	"kubevirt.io/kubevirt/pkg/virt-api/webhooks"
 	mutating_webhook "kubevirt.io/kubevirt/pkg/virt-api/webhooks/mutating-webhook"
 	validating_webhook "kubevirt.io/kubevirt/pkg/virt-api/webhooks/validating-webhook"
 	virtconfig "kubevirt.io/kubevirt/pkg/virt-config"
+	"kubevirt.io/kubevirt/pkg/virt-operator/resource/generate/components"
+	virtoperatorutils "kubevirt.io/kubevirt/pkg/virt-operator/util"
 )
 
 const (
@@ -67,28 +85,17 @@ const (
 	// Default address that virt-api listens on.
 	defaultHost = "0.0.0.0"
 
-	// selfsigned cert secret name
-	virtApiCertSecretName = "kubevirt-virt-api-certs"
+	DefaultConsoleServerPort = 8186
 
-	virtWebhookValidator = "virt-api-validator"
-	virtWebhookMutator   = "virt-api-mutator"
+	defaultCAConfigMapName     = "kubevirt-ca"
+	defaultTlsCertFilePath     = "/etc/virt-api/certificates/tls.crt"
+	defaultTlsKeyFilePath      = "/etc/virt-api/certificates/tls.key"
+	defaultHandlerCertFilePath = "/etc/virt-handler/clientcertificates/tls.crt"
+	defaultHandlerKeyFilePath  = "/etc/virt-handler/clientcertificates/tls.key"
 
-	virtApiServiceName = "virt-api"
-
-	vmiCreateValidatePath       = "/virtualmachineinstances-validate-create"
-	vmiUpdateValidatePath       = "/virtualmachineinstances-validate-update"
-	vmValidatePath              = "/virtualmachines-validate"
-	vmirsValidatePath           = "/virtualmachinereplicaset-validate"
-	vmipresetValidatePath       = "/vmipreset-validate"
-	migrationCreateValidatePath = "/migration-validate-create"
-	migrationUpdateValidatePath = "/migration-validate-update"
-
-	vmiMutatePath       = "/virtualmachineinstances-mutate"
-	migrationMutatePath = "/migration-mutate-create"
-
-	certBytesValue        = "cert-bytes"
-	keyBytesValue         = "key-bytes"
-	signingCertBytesValue = "signing-cert-bytes"
+	httpStatusNotFoundMessage     = "Not Found"
+	httpStatusBadRequestMessage   = "Bad Request"
+	httpStatusInternalServerError = "Internal Server Error"
 )
 
 type VirtApi interface {
@@ -109,14 +116,36 @@ type virtAPIApp struct {
 	certsDirectory   string
 	clusterConfig    *virtconfig.ClusterConfig
 
-	signingCertBytes []byte
-	certBytes        []byte
-	keyBytes         []byte
-	namespace        string
-	tlsConfig        *tls.Config
+	namespace               string
+	host                    string
+	tlsConfig               *tls.Config
+	certificate             *tls.Certificate
+	consoleServerPort       int
+	certmanager             certificate2.Manager
+	handlerTLSConfiguration *tls.Config
+	handlerCertManager      certificate2.Manager
+
+	caConfigMapName              string
+	tlsCertFilePath              string
+	tlsKeyFilePath               string
+	handlerCertFilePath          string
+	handlerKeyFilePath           string
+	externallyManaged            bool
+	reloadableRateLimiter        *ratelimiter.ReloadableRateLimiter
+	reloadableWebhookRateLimiter *ratelimiter.ReloadableRateLimiter
+
+	// indicates if controllers were started with or without CDI/DataSource support
+	hasCDIDataSource bool
+	// the channel used to trigger re-initialization.
+	reInitChan chan string
+
+	kubeVirtServiceAccounts map[string]struct{}
 }
 
-var _ service.Service = &virtAPIApp{}
+var (
+	_                service.Service = &virtAPIApp{}
+	apiHealthVersion                 = new(healthz.KubeApiHealthzVersion)
+)
 
 func NewVirtApi() VirtApi {
 
@@ -128,38 +157,47 @@ func NewVirtApi() VirtApi {
 }
 
 func (app *virtAPIApp) Execute() {
-	virtCli, err := kubecli.GetKubevirtClient()
+	if err := metrics.SetupMetrics(); err != nil {
+		panic(err)
+	}
+
+	app.reloadableRateLimiter = ratelimiter.NewReloadableRateLimiter(flowcontrol.NewTokenBucketRateLimiter(virtconfig.DefaultVirtAPIQPS, virtconfig.DefaultVirtAPIBurst))
+	app.reloadableWebhookRateLimiter = ratelimiter.NewReloadableRateLimiter(flowcontrol.NewTokenBucketRateLimiter(virtconfig.DefaultVirtWebhookClientQPS, virtconfig.DefaultVirtWebhookClientBurst))
+
+	clientmetrics.RegisterRestConfigHooks()
+	clientConfig, err := kubecli.GetKubevirtClientConfig()
+	if err != nil {
+		panic(err)
+	}
+	clientConfig.RateLimiter = app.reloadableRateLimiter
+	app.virtCli, err = kubecli.GetKubevirtClientFromRESTConfig(clientConfig)
 	if err != nil {
 		panic(err)
 	}
 
-	authorizor, err := rest.NewAuthorizor()
+	authorizor, err := rest.NewAuthorizor(app.reloadableWebhookRateLimiter)
 	if err != nil {
 		panic(err)
 	}
 
-	config, err := kubecli.GetConfig()
-	if err != nil {
-		panic(err)
-	}
-
-	app.aggregatorClient = aggregatorclient.NewForConfigOrDie(config)
+	app.aggregatorClient = aggregatorclient.NewForConfigOrDie(clientConfig)
 
 	app.authorizor = authorizor
 
-	app.virtCli = virtCli
-
-	app.certsDirectory, err = ioutil.TempDir("", "certsdir")
+	app.certsDirectory, err = os.MkdirTemp("", "certsdir")
 	if err != nil {
 		panic(err)
 	}
-	app.namespace, err = util.GetNamespace()
+	app.namespace, err = clientutil.GetNamespace()
 	if err != nil {
 		panic(err)
 	}
 
-	app.Compose()
+	app.kubeVirtServiceAccounts = webhooks.KubeVirtServiceAccounts(app.namespace)
+
 	app.ConfigureOpenAPIService()
+	app.reInitChan = make(chan string, 10)
+
 	app.Run()
 }
 
@@ -167,14 +205,17 @@ func subresourceAPIGroup() metav1.APIGroup {
 	apiGroup := metav1.APIGroup{
 		Name: "subresource.kubevirt.io",
 		PreferredVersion: metav1.GroupVersionForDiscovery{
-			GroupVersion: v1.SubresourceGroupVersion.Group + "/" + v1.SubresourceGroupVersion.Version,
-			Version:      v1.SubresourceGroupVersion.Version,
+			GroupVersion: v1.SubresourceGroupVersions[0].Group + "/" + v1.SubresourceGroupVersions[0].Version,
+			Version:      v1.SubresourceGroupVersions[0].Version,
 		},
 	}
-	apiGroup.Versions = append(apiGroup.Versions, metav1.GroupVersionForDiscovery{
-		GroupVersion: v1.SubresourceGroupVersion.Group + "/" + v1.SubresourceGroupVersion.Version,
-		Version:      v1.SubresourceGroupVersion.Version,
-	})
+
+	for _, version := range v1.SubresourceGroupVersions {
+		apiGroup.Versions = append(apiGroup.Versions, metav1.GroupVersionForDiscovery{
+			GroupVersion: version.Group + "/" + version.Version,
+			Version:      version.Version,
+		})
+	}
 	apiGroup.ServerAddressByClientCIDRs = append(apiGroup.ServerAddressByClientCIDRs, metav1.ServerAddressByClientCIDR{
 		ClientCIDR:    "0.0.0.0/0",
 		ServerAddress: "",
@@ -185,151 +226,512 @@ func subresourceAPIGroup() metav1.APIGroup {
 
 func (app *virtAPIApp) composeSubresources() {
 
-	subresourcesvmGVR := schema.GroupVersionResource{Group: v1.SubresourceGroupVersion.Group, Version: v1.SubresourceGroupVersion.Version, Resource: "virtualmachines"}
-	subresourcesvmiGVR := schema.GroupVersionResource{Group: v1.SubresourceGroupVersion.Group, Version: v1.SubresourceGroupVersion.Version, Resource: "virtualmachineinstances"}
+	var subwss []*restful.WebService
 
-	subws := new(restful.WebService)
-	subws.Doc("The KubeVirt Subresource API.")
-	subws.Path(rest.GroupVersionBasePath(v1.SubresourceGroupVersion))
+	for _, version := range v1.SubresourceGroupVersions {
+		subresourcesvmGVR := schema.GroupVersionResource{Group: version.Group, Version: version.Version, Resource: "virtualmachines"}
+		subresourcesvmiGVR := schema.GroupVersionResource{Group: version.Group, Version: version.Version, Resource: "virtualmachineinstances"}
+		expandvmspecGVR := schema.GroupVersionResource{Group: version.Group, Version: version.Version, Resource: "expand-vm-spec"}
 
-	subresourceApp := &rest.SubresourceAPIApp{
-		VirtCli: app.virtCli,
+		subws := new(restful.WebService)
+		subws.Doc(fmt.Sprintf("KubeVirt \"%s\" Subresource API.", version.Version))
+		subws.Path(definitions.GroupVersionBasePath(version))
+
+		subresourceApp := rest.NewSubresourceAPIApp(app.virtCli, app.consoleServerPort, app.handlerTLSConfiguration, app.clusterConfig)
+
+		restartRouteBuilder := subws.PUT(definitions.NamespacedResourcePath(subresourcesvmGVR)+definitions.SubResourcePath("restart")).
+			To(subresourceApp.RestartVMRequestHandler).
+			Consumes(mime.MIME_ANY).
+			Reads(v1.RestartOptions{}).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
+			Operation(version.Version+"Restart").
+			Doc("Restart a VirtualMachine object.").
+			Returns(http.StatusOK, "OK", "").
+			Returns(http.StatusNotFound, httpStatusNotFoundMessage, "").
+			Returns(http.StatusBadRequest, httpStatusBadRequestMessage, "")
+		restartRouteBuilder.ParameterNamed("body").Required(false)
+		subws.Route(restartRouteBuilder)
+
+		subws.Route(subws.PUT(definitions.NamespacedResourcePath(subresourcesvmGVR)+definitions.SubResourcePath("migrate")).
+			To(subresourceApp.MigrateVMRequestHandler).
+			Consumes(mime.MIME_ANY).
+			Reads(v1.MigrateOptions{}).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
+			Operation(version.Version+"Migrate").
+			Doc("Migrate a running VirtualMachine to another node.").
+			Returns(http.StatusOK, "OK", "").
+			Returns(http.StatusNotFound, httpStatusNotFoundMessage, "").
+			Returns(http.StatusBadRequest, httpStatusBadRequestMessage, ""))
+
+		subws.Route(subws.PUT(definitions.NamespacedResourcePath(subresourcesvmGVR)+definitions.SubResourcePath("start")).
+			To(subresourceApp.StartVMRequestHandler).
+			Consumes(mime.MIME_ANY).
+			Reads(v1.StartOptions{}).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
+			Operation(version.Version+"Start").
+			Doc("Start a VirtualMachine object.").
+			Returns(http.StatusOK, "OK", "").
+			Returns(http.StatusNotFound, httpStatusNotFoundMessage, "").
+			Returns(http.StatusBadRequest, httpStatusBadRequestMessage, ""))
+
+		stopRouteBuilder := subws.PUT(definitions.NamespacedResourcePath(subresourcesvmGVR)+definitions.SubResourcePath("stop")).
+			To(subresourceApp.StopVMRequestHandler).
+			Consumes(mime.MIME_ANY).
+			Reads(v1.StopOptions{}).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
+			Operation(version.Version+"Stop").
+			Doc("Stop a VirtualMachine object.").
+			Returns(http.StatusOK, "OK", "").
+			Returns(http.StatusNotFound, httpStatusNotFoundMessage, "").
+			Returns(http.StatusBadRequest, httpStatusBadRequestMessage, "")
+		stopRouteBuilder.ParameterNamed("body").Required(false)
+		subws.Route(stopRouteBuilder)
+
+		subws.Route(subws.GET(definitions.NamespacedResourcePath(subresourcesvmGVR)+definitions.SubResourcePath("expand-spec")).
+			To(subresourceApp.ExpandSpecVMRequestHandler).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
+			Operation(version.Version+"vm-ExpandSpec").
+			Produces(restful.MIME_JSON).
+			Doc("Get VirtualMachine object with expanded instancetype and preference.").
+			Returns(http.StatusOK, "OK", "").
+			Returns(http.StatusNotFound, httpStatusNotFoundMessage, "").
+			Returns(http.StatusInternalServerError, httpStatusInternalServerError, ""))
+
+		subws.Route(subws.PUT(definitions.NamespacedResourcePath(subresourcesvmiGVR)+definitions.SubResourcePath("freeze")).
+			To(subresourceApp.FreezeVMIRequestHandler).
+			Consumes(mime.MIME_ANY).
+			Reads(v1.FreezeUnfreezeTimeout{}).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
+			Operation(version.Version+"Freeze").
+			Doc("Freeze a VirtualMachineInstance object.").
+			Returns(http.StatusOK, "OK", "").
+			Returns(http.StatusInternalServerError, httpStatusInternalServerError, ""))
+
+		subws.Route(subws.PUT(definitions.NamespacedResourcePath(subresourcesvmiGVR)+definitions.SubResourcePath("unfreeze")).
+			To(subresourceApp.UnfreezeVMIRequestHandler).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
+			Operation(version.Version+"Unfreeze").
+			Doc("Unfreeze a VirtualMachineInstance object.").
+			Returns(http.StatusOK, "OK", "").
+			Returns(http.StatusInternalServerError, httpStatusInternalServerError, ""))
+
+		subws.Route(subws.PUT(definitions.NamespacedResourcePath(subresourcesvmiGVR)+definitions.SubResourcePath("softreboot")).
+			To(subresourceApp.SoftRebootVMIRequestHandler).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
+			Operation(version.Version+"SoftReboot").
+			Doc("Soft reboot a VirtualMachineInstance object.").
+			Returns(http.StatusOK, "OK", "").
+			Returns(http.StatusInternalServerError, httpStatusInternalServerError, ""))
+
+		subws.Route(subws.PUT(definitions.NamespacedResourcePath(subresourcesvmiGVR)+definitions.SubResourcePath("pause")).
+			To(subresourceApp.PauseVMIRequestHandler).
+			Consumes(mime.MIME_ANY).
+			Reads(v1.PauseOptions{}).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
+			Operation(version.Version+"Pause").
+			Doc("Pause a VirtualMachineInstance object.").
+			Returns(http.StatusOK, "OK", "").
+			Returns(http.StatusNotFound, httpStatusNotFoundMessage, "").
+			Returns(http.StatusBadRequest, httpStatusBadRequestMessage, ""))
+
+		subws.Route(subws.PUT(definitions.NamespacedResourcePath(subresourcesvmiGVR)+definitions.SubResourcePath("unpause")).
+			To(subresourceApp.UnpauseVMIRequestHandler). // handles VMIs as well
+			Consumes(mime.MIME_ANY).
+			Reads(v1.UnpauseOptions{}).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
+			Operation(version.Version+"Unpause").
+			Doc("Unpause a VirtualMachineInstance object.").
+			Returns(http.StatusOK, "OK", "").
+			Returns(http.StatusNotFound, httpStatusNotFoundMessage, "").
+			Returns(http.StatusBadRequest, httpStatusBadRequestMessage, ""))
+
+		subws.Route(subws.GET(definitions.NamespacedResourcePath(subresourcesvmiGVR) + definitions.SubResourcePath("console")).
+			To(subresourceApp.ConsoleRequestHandler).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
+			Operation(version.Version + "Console").
+			Doc("Open a websocket connection to a serial console on the specified VirtualMachineInstance."))
+
+		subws.Route(subws.GET(definitions.NamespacedResourcePath(subresourcesvmiGVR) + definitions.SubResourcePath("vnc")).
+			To(subresourceApp.VNCRequestHandler).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
+			Operation(version.Version + "VNC").
+			Doc("Open a websocket connection to connect to VNC on the specified VirtualMachineInstance."))
+		subws.Route(subws.GET(definitions.NamespacedResourcePath(subresourcesvmiGVR) + definitions.SubResourcePath("vnc/screenshot")).
+			To(subresourceApp.VNCScreenshotRequestHandler).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).Param(definitions.MoveCursorParam(subws)).
+			Operation(version.Version + "VNCScreenshot").
+			Doc("Get a PNG VNC screenshot of the specified VirtualMachineInstance."))
+		subws.Route(subws.GET(definitions.NamespacedResourcePath(subresourcesvmiGVR) + definitions.SubResourcePath("usbredir")).
+			To(subresourceApp.USBRedirRequestHandler).
+			Param(definitions.NamespaceParam(subws)).
+			Param(definitions.NameParam(subws)).
+			Operation(version.Version + "usbredir").
+			Doc("Open a websocket connection to connect to USB device on the specified VirtualMachineInstance."))
+
+		// VMI endpoint
+		subws.Route(subws.GET(definitions.NamespacedResourcePath(subresourcesvmiGVR) + definitions.SubResourcePath("portforward") + definitions.PortPath).
+			To(subresourceApp.PortForwardRequestHandler(subresourceApp.FetchVirtualMachineInstance)).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
+			Param(definitions.PortForwardPortParameter(subws)).
+			Operation(version.Version + "vmi-PortForward").
+			Doc("Open a websocket connection forwarding traffic to the specified VirtualMachineInstance and port."))
+		subws.Route(subws.GET(definitions.NamespacedResourcePath(subresourcesvmiGVR) + definitions.SubResourcePath("portforward") + definitions.PortPath + definitions.ProtocolPath).
+			To(subresourceApp.PortForwardRequestHandler(subresourceApp.FetchVirtualMachineInstance)).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
+			Param(definitions.PortForwardPortParameter(subws)).
+			Param(definitions.PortForwardProtocolParameter(subws)).
+			Operation(version.Version + "vmi-PortForwardWithProtocol").
+			Doc("Open a websocket connection forwarding traffic of the specified protocol (either tcp or udp) to the specified VirtualMachineInstance and port."))
+		subws.Route(subws.GET(definitions.NamespacedResourcePath(subresourcesvmiGVR) + definitions.SubResourcePath("vsock")).
+			To(subresourceApp.VSOCKRequestHandler).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).Param(definitions.VSOCKPortParameter(subws)).Param(definitions.VSOCKTLSParameter(subws)).
+			Operation(version.Version + "VSOCK").
+			Doc("Open a websocket connection forwarding traffic to the specified VirtualMachineInstance and port via VSOCK."))
+
+		// VM endpoint
+		subws.Route(subws.GET(definitions.NamespacedResourcePath(subresourcesvmGVR) + definitions.SubResourcePath("portforward") + definitions.PortPath).
+			To(subresourceApp.PortForwardRequestHandler(subresourceApp.FetchVirtualMachineInstanceForVM)).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
+			Param(definitions.PortForwardPortParameter(subws)).
+			Operation(version.Version + "vm-PortForward").
+			Doc("Open a websocket connection forwarding traffic to the running VMI for the specified VirtualMachine and port."))
+		subws.Route(subws.GET(definitions.NamespacedResourcePath(subresourcesvmGVR) + definitions.SubResourcePath("portforward") + definitions.PortPath + definitions.ProtocolPath).
+			To(subresourceApp.PortForwardRequestHandler(subresourceApp.FetchVirtualMachineInstanceForVM)).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
+			Param(definitions.PortForwardPortParameter(subws)).
+			Param(definitions.PortForwardProtocolParameter(subws)).
+			Operation(version.Version + "vm-PortForwardWithProtocol").
+			Doc("Open a websocket connection forwarding traffic of the specified protocol (either tcp or udp) to the specified VirtualMachine and port."))
+
+		subws.Route(subws.PUT(definitions.NamespacedResourceBasePath(expandvmspecGVR)).
+			To(subresourceApp.ExpandSpecRequestHandler).
+			Param(definitions.NamespaceParam(subws)).
+			Operation(version.Version+"ExpandSpec").
+			Consumes(restful.MIME_JSON).
+			Produces(restful.MIME_JSON).
+			Doc("Expands instancetype and preference into the passed VirtualMachine object.").
+			Returns(http.StatusOK, "OK", "").
+			Returns(http.StatusBadRequest, httpStatusBadRequestMessage, "").
+			Returns(http.StatusInternalServerError, httpStatusInternalServerError, ""))
+
+		subws.Route(subws.GET(definitions.SubResourcePath("version")).Produces(restful.MIME_JSON).
+			To(func(request *restful.Request, response *restful.Response) {
+				response.WriteAsJson(virtversion.Get())
+			}).Operation(version.Version + "Version"))
+
+		subws.Route(subws.GET(definitions.SubResourcePath("start-cluster-profiler")).Produces(restful.MIME_JSON).
+			To(subresourceApp.StartClusterProfilerHandler).
+			Operation(version.Version + "start-cluster-profiler"))
+
+		subws.Route(subws.GET(definitions.SubResourcePath("stop-cluster-profiler")).Produces(restful.MIME_JSON).
+			To(subresourceApp.StopClusterProfilerHandler).
+			Operation(version.Version + "stop-cluster-profiler"))
+
+		subws.Route(subws.GET(definitions.SubResourcePath("dump-cluster-profiler")).Produces(restful.MIME_JSON).
+			To(subresourceApp.DumpClusterProfilerHandler).
+			Operation(version.Version + "dump-cluster-profiler"))
+
+		subws.Route(subws.GET(definitions.SubResourcePath("guestfs")).Produces(restful.MIME_JSON).
+			To(app.GetGsInfo()).
+			Operation(version.Version+"Guestfs").
+			Returns(http.StatusOK, "OK", "").
+			Returns(http.StatusBadRequest, httpStatusBadRequestMessage, ""))
+		subws.Route(subws.GET(definitions.SubResourcePath("healthz")).
+			To(healthz.KubeConnectionHealthzFuncFactory(app.clusterConfig, apiHealthVersion)).
+			Consumes(restful.MIME_JSON).
+			Produces(restful.MIME_JSON).
+			Operation(version.Version+"CheckHealth").
+			Doc("Health endpoint").
+			Returns(http.StatusOK, "OK", "").
+			Returns(http.StatusInternalServerError, "Unhealthy", ""))
+		subws.Route(subws.GET(definitions.NamespacedResourcePath(subresourcesvmiGVR)+definitions.SubResourcePath("guestosinfo")).
+			To(subresourceApp.GuestOSInfo).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
+			Consumes(restful.MIME_JSON).
+			Produces(restful.MIME_JSON).
+			Operation(version.Version+"Guestosinfo").
+			Doc("Get guest agent os information").
+			Writes(v1.VirtualMachineInstanceGuestAgentInfo{}).
+			Returns(http.StatusOK, "OK", v1.VirtualMachineInstanceGuestAgentInfo{}))
+
+		subws.Route(subws.GET(definitions.NamespacedResourcePath(subresourcesvmiGVR)+definitions.SubResourcePath("userlist")).
+			To(subresourceApp.UserList).
+			Consumes(restful.MIME_JSON).
+			Produces(restful.MIME_JSON).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
+			Operation(version.Version+"Userlist").
+			Doc("Get list of active users via guest agent").
+			Writes(v1.VirtualMachineInstanceGuestOSUserList{}).
+			Returns(http.StatusOK, "OK", v1.VirtualMachineInstanceGuestOSUserList{}))
+
+		subws.Route(subws.GET(definitions.NamespacedResourcePath(subresourcesvmiGVR)+definitions.SubResourcePath("filesystemlist")).
+			To(subresourceApp.FilesystemList).
+			Consumes(restful.MIME_JSON).
+			Produces(restful.MIME_JSON).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
+			Operation(version.Version+"Filesystemlist").
+			Doc("Get list of active filesystems on guest machine via guest agent").
+			Writes(v1.VirtualMachineInstanceFileSystemList{}).
+			Returns(http.StatusOK, "OK", v1.VirtualMachineInstanceFileSystemList{}))
+
+		subws.Route(subws.PUT(definitions.NamespacedResourcePath(subresourcesvmiGVR)+definitions.SubResourcePath("addvolume")).
+			To(subresourceApp.VMIAddVolumeRequestHandler).
+			Consumes(mime.MIME_ANY).
+			Reads(v1.AddVolumeOptions{}).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
+			Operation(version.Version+"vmi-addvolume").
+			Doc("Add a volume and disk to a running Virtual Machine Instance").
+			Returns(http.StatusOK, "OK", "").
+			Returns(http.StatusBadRequest, httpStatusBadRequestMessage, ""))
+
+		subws.Route(subws.PUT(definitions.NamespacedResourcePath(subresourcesvmiGVR)+definitions.SubResourcePath("removevolume")).
+			To(subresourceApp.VMIRemoveVolumeRequestHandler).
+			Consumes(mime.MIME_ANY).
+			Reads(v1.RemoveVolumeOptions{}).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
+			Operation(version.Version+"vmi-removevolume").
+			Doc("Removes a volume and disk from a running Virtual Machine Instance").
+			Returns(http.StatusOK, "OK", "").
+			Returns(http.StatusBadRequest, httpStatusBadRequestMessage, ""))
+
+		subws.Route(subws.PUT(definitions.NamespacedResourcePath(subresourcesvmGVR)+definitions.SubResourcePath("addvolume")).
+			To(subresourceApp.VMAddVolumeRequestHandler).
+			Consumes(mime.MIME_ANY).
+			Reads(v1.AddVolumeOptions{}).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
+			Operation(version.Version+"vm-addvolume").
+			Doc("Add a volume and disk to a running Virtual Machine.").
+			Returns(http.StatusOK, "OK", "").
+			Returns(http.StatusBadRequest, httpStatusBadRequestMessage, ""))
+
+		subws.Route(subws.PUT(definitions.NamespacedResourcePath(subresourcesvmGVR)+definitions.SubResourcePath("removevolume")).
+			To(subresourceApp.VMRemoveVolumeRequestHandler).
+			Consumes(mime.MIME_ANY).
+			Reads(v1.RemoveVolumeOptions{}).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
+			Operation(version.Version+"vm-removevolume").
+			Doc("Removes a volume and disk from a running Virtual Machine.").
+			Returns(http.StatusOK, "OK", "").
+			Returns(http.StatusBadRequest, httpStatusBadRequestMessage, ""))
+
+		subws.Route(subws.PUT(definitions.NamespacedResourcePath(subresourcesvmGVR)+definitions.SubResourcePath("memorydump")).
+			To(subresourceApp.MemoryDumpVMRequestHandler).
+			Consumes(mime.MIME_ANY).
+			Reads(v1.VirtualMachineMemoryDumpRequest{}).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
+			Operation(version.Version+"MemoryDump").
+			Doc("Dumps a VirtualMachineInstance memory.").
+			Returns(http.StatusOK, "OK", "").
+			Returns(http.StatusInternalServerError, httpStatusInternalServerError, ""))
+
+		subws.Route(subws.PUT(definitions.NamespacedResourcePath(subresourcesvmGVR)+definitions.SubResourcePath("removememorydump")).
+			To(subresourceApp.RemoveMemoryDumpVMRequestHandler).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
+			Operation(version.Version+"RemoveMemoryDump").
+			Doc("Remove memory dump association.").
+			Returns(http.StatusOK, "OK", "").
+			Returns(http.StatusInternalServerError, httpStatusInternalServerError, ""))
+
+		// AMD SEV endpoints
+		subws.Route(subws.GET(definitions.NamespacedResourcePath(subresourcesvmiGVR)+definitions.SubResourcePath("sev/fetchcertchain")).
+			To(subresourceApp.SEVFetchCertChainRequestHandler).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
+			Consumes(restful.MIME_JSON).
+			Produces(restful.MIME_JSON).
+			Operation(version.Version+"SEVFetchCertChain").
+			Doc("Fetch SEV certificate chain from the node where Virtual Machine is scheduled").
+			Writes(v1.SEVPlatformInfo{}).
+			Returns(http.StatusOK, "OK", v1.SEVPlatformInfo{}))
+
+		subws.Route(subws.GET(definitions.NamespacedResourcePath(subresourcesvmiGVR)+definitions.SubResourcePath("sev/querylaunchmeasurement")).
+			To(subresourceApp.SEVQueryLaunchMeasurementHandler).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
+			Consumes(restful.MIME_JSON).
+			Produces(restful.MIME_JSON).
+			Operation(version.Version+"SEVQueryLaunchMeasurement").
+			Doc("Query SEV launch measurement from a Virtual Machine").
+			Writes(v1.SEVMeasurementInfo{}).
+			Returns(http.StatusOK, "OK", v1.SEVMeasurementInfo{}))
+
+		subws.Route(subws.PUT(definitions.NamespacedResourcePath(subresourcesvmiGVR)+definitions.SubResourcePath("sev/setupsession")).
+			To(subresourceApp.SEVSetupSessionHandler).
+			Consumes(mime.MIME_ANY).
+			Reads(v1.SEVSessionOptions{}).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
+			Operation(version.Version+"SEVSetupSession").
+			Doc("Setup SEV session parameters for a Virtual Machine").
+			Returns(http.StatusOK, "OK", "").
+			Returns(http.StatusBadRequest, httpStatusBadRequestMessage, ""))
+
+		subws.Route(subws.PUT(definitions.NamespacedResourcePath(subresourcesvmiGVR)+definitions.SubResourcePath("sev/injectlaunchsecret")).
+			To(subresourceApp.SEVInjectLaunchSecretHandler).
+			Consumes(mime.MIME_ANY).
+			Reads(v1.SEVSecretOptions{}).
+			Param(definitions.NamespaceParam(subws)).Param(definitions.NameParam(subws)).
+			Operation(version.Version+"SEVInjectLaunchSecret").
+			Doc("Inject SEV launch secret into a Virtual Machine").
+			Returns(http.StatusOK, "OK", "").
+			Returns(http.StatusBadRequest, httpStatusBadRequestMessage, ""))
+
+		// Return empty api resource list.
+		// K8s expects to be able to retrieve a resource list for each aggregated
+		// app in order to discover what resources it provides. Without returning
+		// an empty list here, there's a bug in the k8s resource discovery that
+		// breaks kubectl's ability to reference short names for resources.
+		subws.Route(subws.GET("/").
+			Produces(restful.MIME_JSON).Writes(metav1.APIResourceList{}).
+			To(func(request *restful.Request, response *restful.Response) {
+				list := &metav1.APIResourceList{}
+
+				list.Kind = "APIResourceList"
+				list.GroupVersion = version.Group + "/" + version.Version
+				list.APIVersion = "v1"
+				list.APIResources = []metav1.APIResource{
+					{
+						Name:       "expand-vm-spec",
+						Namespaced: true,
+					},
+					{
+						Name:       "virtualmachineinstances/vnc",
+						Namespaced: true,
+					},
+					{
+						Name:       "virtualmachineinstances/console",
+						Namespaced: true,
+					},
+					{
+						Name:       "virtualmachineinstances/portforward",
+						Namespaced: true,
+					},
+					{
+						Name:       "virtualmachineinstances/pause",
+						Namespaced: true,
+					},
+					{
+						Name:       "virtualmachineinstances/unpause",
+						Namespaced: true,
+					},
+					{
+						Name:       "virtualmachineinstances/freeze",
+						Namespaced: true,
+					},
+					{
+						Name:       "virtualmachineinstances/unfreeze",
+						Namespaced: true,
+					},
+					{
+						Name:       "virtualmachineinstances/softreboot",
+						Namespaced: true,
+					},
+					{
+						Name:       "virtualmachines/start",
+						Namespaced: true,
+					},
+					{
+						Name:       "virtualmachines/stop",
+						Namespaced: true,
+					},
+					{
+						Name:       "virtualmachines/restart",
+						Namespaced: true,
+					},
+					{
+						Name:       "virtualmachines/migrate",
+						Namespaced: true,
+					},
+					{
+						Name:       "virtualmachines/expand-spec",
+						Namespaced: true,
+					},
+					{
+						Name:       "virtualmachineinstances/guestosinfo",
+						Namespaced: true,
+					},
+					{
+						Name:       "virtualmachineinstances/userlist",
+						Namespaced: true,
+					},
+					{
+						Name:       "virtualmachineinstances/filesystemlist",
+						Namespaced: true,
+					},
+					{
+						Name:       "virtualmachineinstances/addvolume",
+						Namespaced: true,
+					},
+					{
+						Name:       "virtualmachineinstances/removevolume",
+						Namespaced: true,
+					},
+					{
+						Name:       "virtualmachineinstances/sev/fetchcertchain",
+						Namespaced: true,
+					},
+					{
+						Name:       "virtualmachineinstances/sev/querylaunchmeasurement",
+						Namespaced: true,
+					},
+					{
+						Name:       "virtualmachineinstances/sev/setupsession",
+						Namespaced: true,
+					},
+					{
+						Name:       "virtualmachineinstances/sev/injectlaunchsecret",
+						Namespaced: true,
+					},
+				}
+
+				response.WriteAsJson(list)
+			}).
+			Operation(version.Version+"getAPISubResources").
+			Doc("Get a KubeVirt API resources").
+			Returns(http.StatusOK, "OK", metav1.APIResourceList{}).
+			Returns(http.StatusNotFound, httpStatusNotFoundMessage, ""))
+
+		restful.Add(subws)
+
+		subwss = append(subwss, subws)
 	}
-
-	subws.Route(subws.PUT(rest.ResourcePath(subresourcesvmGVR)+rest.SubResourcePath("restart")).
-		To(subresourceApp.RestartVMRequestHandler).
-		Param(rest.NamespaceParam(subws)).Param(rest.NameParam(subws)).
-		Operation("restart").
-		Doc("Restart a VirtualMachine object.").
-		Returns(http.StatusOK, "OK", nil).
-		Returns(http.StatusNotFound, "Not Found", nil))
-
-	subws.Route(subws.PUT(rest.ResourcePath(subresourcesvmGVR)+rest.SubResourcePath("start")).
-		To(subresourceApp.StartVMRequestHandler).
-		Param(rest.NamespaceParam(subws)).Param(rest.NameParam(subws)).
-		Operation("start").
-		Doc("Start a VirtualMachine object.").
-		Returns(http.StatusOK, "OK", nil).
-		Returns(http.StatusNotFound, "Not Found", nil))
-
-	subws.Route(subws.PUT(rest.ResourcePath(subresourcesvmGVR)+rest.SubResourcePath("stop")).
-		To(subresourceApp.StopVMRequestHandler).
-		Param(rest.NamespaceParam(subws)).Param(rest.NameParam(subws)).
-		Operation("stop").
-		Doc("Stop a VirtualMachine object.").
-		Returns(http.StatusOK, "OK", nil).
-		Returns(http.StatusNotFound, "Not Found", nil))
-
-	subws.Route(subws.GET(rest.ResourcePath(subresourcesvmiGVR) + rest.SubResourcePath("console")).
-		To(subresourceApp.ConsoleRequestHandler).
-		Param(rest.NamespaceParam(subws)).Param(rest.NameParam(subws)).
-		Operation("console").
-		Doc("Open a websocket connection to a serial console on the specified VirtualMachineInstance."))
-
-	subws.Route(subws.GET(rest.ResourcePath(subresourcesvmiGVR) + rest.SubResourcePath("vnc")).
-		To(subresourceApp.VNCRequestHandler).
-		Param(rest.NamespaceParam(subws)).Param(rest.NameParam(subws)).
-		Operation("vnc").
-		Doc("Open a websocket connection to connect to VNC on the specified VirtualMachineInstance."))
-
-	subws.Route(subws.GET(rest.ResourcePath(subresourcesvmiGVR) + rest.SubResourcePath("test")).
-		To(func(request *restful.Request, response *restful.Response) {
-			response.WriteHeader(http.StatusOK)
-		}).
-		Param(rest.NamespaceParam(subws)).Param(rest.NameParam(subws)).
-		Operation("test").
-		Doc("Test endpoint verifying apiserver connectivity."))
-
-	subws.Route(subws.GET(rest.SubResourcePath("version")).Produces(restful.MIME_JSON).
-		To(func(request *restful.Request, response *restful.Response) {
-			response.WriteAsJson(version.Get())
-		}).Operation("version"))
-
-	subws.Route(subws.GET(rest.SubResourcePath("healthz")).
-		To(healthz.KubeConnectionHealthzFunc).
-		Consumes(restful.MIME_JSON).
-		Produces(restful.MIME_JSON).
-		Operation("checkHealth").
-		Doc("Health endpoint").
-		Returns(http.StatusOK, "OK", nil).
-		Returns(http.StatusInternalServerError, "Unhealthy", nil))
-
-	// Return empty api resource list.
-	// K8s expects to be able to retrieve a resource list for each aggregated
-	// app in order to discover what resources it provides. Without returning
-	// an empty list here, there's a bug in the k8s resource discovery that
-	// breaks kubectl's ability to reference short names for resources.
-	subws.Route(subws.GET("/").
-		Produces(restful.MIME_JSON).Writes(metav1.APIResourceList{}).
-		To(func(request *restful.Request, response *restful.Response) {
-			list := &metav1.APIResourceList{}
-
-			list.Kind = "APIResourceList"
-			list.GroupVersion = v1.SubresourceGroupVersion.Group + "/" + v1.SubresourceGroupVersion.Version
-			list.APIVersion = v1.SubresourceGroupVersion.Version
-			list.APIResources = []metav1.APIResource{
-				{
-					Name:       "virtualmachineinstances/vnc",
-					Namespaced: true,
-				},
-				{
-					Name:       "virtualmachines/restart",
-					Namespaced: true,
-				},
-				{
-					Name:       "virtualmachines/start",
-					Namespaced: true,
-				},
-				{
-					Name:       "virtualmachines/stop",
-					Namespaced: true,
-				},
-				{
-					Name:       "virtualmachineinstances/console",
-					Namespaced: true,
-				},
-			}
-
-			response.WriteAsJson(list)
-		}).
-		Operation("getAPIResources").
-		Doc("Get a KubeVirt API resources").
-		Returns(http.StatusOK, "OK", metav1.APIResourceList{}).
-		Returns(http.StatusNotFound, "Not Found", nil))
-
-	restful.Add(subws)
-
 	ws := new(restful.WebService)
 
 	// K8s needs the ability to query the root paths
 	ws.Route(ws.GET("/").
 		Produces(restful.MIME_JSON).Writes(metav1.RootPaths{}).
 		To(func(request *restful.Request, response *restful.Response) {
+			paths := []string{
+				"/apis",
+				"/openapi/v2",
+			}
+			for _, version := range v1.SubresourceGroupVersions {
+				paths = append(paths, definitions.GroupBasePath(version))
+				paths = append(paths, definitions.GroupVersionBasePath(version))
+			}
 			response.WriteAsJson(&metav1.RootPaths{
-				Paths: []string{
-					"/apis",
-					"/apis/",
-					rest.GroupBasePath(v1.SubresourceGroupVersion),
-					rest.GroupVersionBasePath(v1.SubresourceGroupVersion),
-					"/openapi/v2",
-				},
+				Paths: paths,
 			})
 		}).
 		Operation("getRootPaths").
 		Doc("Get KubeVirt API root paths").
 		Returns(http.StatusOK, "OK", metav1.RootPaths{}).
-		Returns(http.StatusNotFound, "Not Found", nil))
+		Returns(http.StatusNotFound, httpStatusNotFoundMessage, ""))
+	ws.Route(ws.GET("/healthz").To(healthz.KubeConnectionHealthzFuncFactory(app.clusterConfig, apiHealthVersion)).Doc("Health endpoint"))
+
+	componentProfiler := profiler.NewProfileManager(app.clusterConfig)
+
+	ws.Route(ws.GET("/start-profiler").To(componentProfiler.HandleStartProfiler).Doc("start profiler endpoint"))
+	ws.Route(ws.GET("/stop-profiler").To(componentProfiler.HandleStopProfiler).Doc("stop profiler endpoint"))
+	ws.Route(ws.GET("/dump-profiler").To(componentProfiler.HandleDumpProfiler).Doc("dump profiler results endpoint"))
 
 	// K8s needs the ability to query info about a specific API group
-	ws.Route(ws.GET(rest.GroupBasePath(v1.SubresourceGroupVersion)).
+	ws.Route(ws.GET(definitions.GroupBasePath(v1.SubresourceGroupVersions[0])).
 		Produces(restful.MIME_JSON).Writes(metav1.APIGroup{}).
 		To(func(request *restful.Request, response *restful.Response) {
 			response.WriteAsJson(subresourceAPIGroup())
 		}).
-		Operation("getAPIGroup").
+		Operation(v1.SubresourceGroupVersions[0].Version+"GetSubAPIGroup").
 		Doc("Get a KubeVirt API Group").
 		Returns(http.StatusOK, "OK", metav1.APIGroup{}).
-		Returns(http.StatusNotFound, "Not Found", nil))
+		Returns(http.StatusNotFound, httpStatusNotFoundMessage, ""))
 
 	// K8s needs the ability to query the list of API groups this endpoint supports
 	ws.Route(ws.GET("apis").
@@ -343,7 +745,7 @@ func (app *virtAPIApp) composeSubresources() {
 		Operation("getAPIGroupList").
 		Doc("Get a KubeVirt API GroupList").
 		Returns(http.StatusOK, "OK", metav1.APIGroupList{}).
-		Returns(http.StatusNotFound, "Not Found", nil))
+		Returns(http.StatusNotFound, httpStatusNotFoundMessage, ""))
 
 	once := sync.Once{}
 	var openapispec *spec.Swagger
@@ -352,8 +754,8 @@ func (app *virtAPIApp) composeSubresources() {
 		Produces(restful.MIME_JSON).
 		To(func(request *restful.Request, response *restful.Response) {
 			once.Do(func() {
-				openapispec = openapi.LoadOpenAPISpec([]*restful.WebService{ws, subws})
-				openapispec.Info.Version = version.Get().String()
+				openapispec = openapi.LoadOpenAPISpec([]*restful.WebService{ws, subwss[0]})
+				openapispec.Info.Version = virtversion.Get().String()
 			})
 			response.WriteAsJson(openapispec)
 		}))
@@ -384,7 +786,22 @@ func (app *virtAPIApp) Compose() {
 }
 
 func (app *virtAPIApp) ConfigureOpenAPIService() {
-	restful.DefaultContainer.Add(restfulspec.NewOpenAPIService(openapi.CreateOpenAPIConfig(restful.RegisteredWebServices())))
+	config := openapi.CreateV3Config()
+	config.GetDefinitions = v12.GetOpenAPIDefinitions
+	spec, err := builderv3.BuildOpenAPISpecFromRoutes(restfuladapter.AdaptWebServices(restful.RegisteredWebServices()), config)
+	if err != nil {
+		panic(err)
+	}
+
+	ws := new(restful.WebService)
+	ws.Path("/swaggerapi")
+	ws.Produces(restful.MIME_JSON)
+	f := func(req *restful.Request, resp *restful.Response) {
+		resp.WriteAsJson(spec)
+	}
+	ws.Route(ws.GET("/").To(f))
+
+	restful.DefaultContainer.Add(ws)
 	http.Handle("/swagger-ui/", http.StripPrefix("/swagger-ui/", http.FileServer(http.Dir(app.SwaggerUI))))
 }
 
@@ -400,7 +817,7 @@ func deserializeStrings(in string) ([]string, error) {
 }
 
 func (app *virtAPIApp) readRequestHeader() error {
-	authConfigMap, err := app.virtCli.CoreV1().ConfigMaps(metav1.NamespaceSystem).Get(util.ExtensionAPIServerAuthenticationConfigMap, metav1.GetOptions{})
+	authConfigMap, err := app.virtCli.CoreV1().ConfigMaps(metav1.NamespaceSystem).Get(context.Background(), util.ExtensionAPIServerAuthenticationConfigMap, metav1.GetOptions{})
 	if err != nil {
 		return err
 	}
@@ -444,620 +861,306 @@ func (app *virtAPIApp) readRequestHeader() error {
 	return nil
 }
 
-func (app *virtAPIApp) getSelfSignedCert() error {
-	var ok bool
-
-	generateCerts := false
-	secret, err := app.virtCli.CoreV1().Secrets(app.namespace).Get(virtApiCertSecretName, metav1.GetOptions{})
-	if err != nil {
-		if k8serrors.IsNotFound(err) {
-			generateCerts = true
-		} else {
-			return err
-		}
-	}
-
-	if generateCerts {
-		// Generate new certs if secret doesn't already exist
-		caKeyPair, _ := triple.NewCA("kubevirt.io")
-		keyPair, _ := triple.NewServerKeyPair(
-			caKeyPair,
-			"virt-api."+app.namespace+".pod.cluster.local",
-			"virt-api",
-			app.namespace,
-			"cluster.local",
-			nil,
-			nil,
-		)
-
-		app.keyBytes = cert.EncodePrivateKeyPEM(keyPair.Key)
-		app.certBytes = cert.EncodeCertPEM(keyPair.Cert)
-		app.signingCertBytes = cert.EncodeCertPEM(caKeyPair.Cert)
-
-		secret := k8sv1.Secret{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      virtApiCertSecretName,
-				Namespace: app.namespace,
-				Labels: map[string]string{
-					v1.AppLabel: "virt-api-aggregator",
-				},
-			},
-			Type: "Opaque",
-			Data: map[string][]byte{
-				certBytesValue:        app.certBytes,
-				keyBytesValue:         app.keyBytes,
-				signingCertBytesValue: app.signingCertBytes,
-			},
-		}
-		_, err := app.virtCli.CoreV1().Secrets(app.namespace).Create(&secret)
-		if err != nil {
-			return err
-		}
-	} else {
-		// retrieve self signed cert info from secret
-
-		app.certBytes, ok = secret.Data[certBytesValue]
-		if !ok {
-			return fmt.Errorf("%s value not found in %s virt-api secret", certBytesValue, virtApiCertSecretName)
-		}
-		app.keyBytes, ok = secret.Data[keyBytesValue]
-		if !ok {
-			return fmt.Errorf("%s value not found in %s virt-api secret", keyBytesValue, virtApiCertSecretName)
-		}
-		app.signingCertBytes, ok = secret.Data[signingCertBytesValue]
-		if !ok {
-			return fmt.Errorf("%s value not found in %s virt-api secret", signingCertBytesValue, virtApiCertSecretName)
-		}
-	}
-	return nil
+func (app *virtAPIApp) prepareCertManager() {
+	app.certmanager = bootstrap.NewFileCertificateManager(app.tlsCertFilePath, app.tlsKeyFilePath)
+	app.handlerCertManager = bootstrap.NewFileCertificateManager(app.handlerCertFilePath, app.handlerKeyFilePath)
 }
 
-func (app *virtAPIApp) createWebhook() error {
-	err := app.createValidatingWebhook()
-	if err != nil {
-		return err
-	}
-	err = app.createMutatingWebhook()
-	if err != nil {
-		return err
-	}
-	return nil
-}
+func (app *virtAPIApp) registerValidatingWebhooks(informers *webhooks.Informers) {
 
-func (app *virtAPIApp) validatingWebhooks() []admissionregistrationv1beta1.Webhook {
-
-	vmiPathCreate := vmiCreateValidatePath
-	vmiPathUpdate := vmiUpdateValidatePath
-	vmPath := vmValidatePath
-	vmirsPath := vmirsValidatePath
-	vmipresetPath := vmipresetValidatePath
-	migrationCreatePath := migrationCreateValidatePath
-	migrationUpdatePath := migrationUpdateValidatePath
-	failurePolicy := admissionregistrationv1beta1.Fail
-
-	webHooks := []admissionregistrationv1beta1.Webhook{
-		{
-			Name:          "virtualmachineinstances-create-validator.kubevirt.io",
-			FailurePolicy: &failurePolicy,
-			Rules: []admissionregistrationv1beta1.RuleWithOperations{{
-				Operations: []admissionregistrationv1beta1.OperationType{
-					admissionregistrationv1beta1.Create,
-				},
-				Rule: admissionregistrationv1beta1.Rule{
-					APIGroups:   []string{v1.GroupName},
-					APIVersions: []string{v1.VirtualMachineInstanceGroupVersionKind.Version},
-					Resources:   []string{"virtualmachineinstances"},
-				},
-			}},
-			ClientConfig: admissionregistrationv1beta1.WebhookClientConfig{
-				Service: &admissionregistrationv1beta1.ServiceReference{
-					Namespace: app.namespace,
-					Name:      virtApiServiceName,
-					Path:      &vmiPathCreate,
-				},
-				CABundle: app.signingCertBytes,
-			},
-		},
-		{
-			Name:          "virtualmachineinstances-update-validator.kubevirt.io",
-			FailurePolicy: &failurePolicy,
-			Rules: []admissionregistrationv1beta1.RuleWithOperations{{
-				Operations: []admissionregistrationv1beta1.OperationType{
-					admissionregistrationv1beta1.Update,
-				},
-				Rule: admissionregistrationv1beta1.Rule{
-					APIGroups:   []string{v1.GroupName},
-					APIVersions: []string{v1.VirtualMachineInstanceGroupVersionKind.Version},
-					Resources:   []string{"virtualmachineinstances"},
-				},
-			}},
-			ClientConfig: admissionregistrationv1beta1.WebhookClientConfig{
-				Service: &admissionregistrationv1beta1.ServiceReference{
-					Namespace: app.namespace,
-					Name:      virtApiServiceName,
-					Path:      &vmiPathUpdate,
-				},
-				CABundle: app.signingCertBytes,
-			},
-		},
-		{
-			Name:          "virtualmachine-validator.kubevirt.io",
-			FailurePolicy: &failurePolicy,
-			Rules: []admissionregistrationv1beta1.RuleWithOperations{{
-				Operations: []admissionregistrationv1beta1.OperationType{
-					admissionregistrationv1beta1.Create,
-					admissionregistrationv1beta1.Update,
-				},
-				Rule: admissionregistrationv1beta1.Rule{
-					APIGroups:   []string{v1.GroupName},
-					APIVersions: []string{v1.VirtualMachineGroupVersionKind.Version},
-					Resources:   []string{"virtualmachines"},
-				},
-			}},
-			ClientConfig: admissionregistrationv1beta1.WebhookClientConfig{
-				Service: &admissionregistrationv1beta1.ServiceReference{
-					Namespace: app.namespace,
-					Name:      virtApiServiceName,
-					Path:      &vmPath,
-				},
-				CABundle: app.signingCertBytes,
-			},
-		},
-		{
-			Name:          "virtualmachinereplicaset-validator.kubevirt.io",
-			FailurePolicy: &failurePolicy,
-			Rules: []admissionregistrationv1beta1.RuleWithOperations{{
-				Operations: []admissionregistrationv1beta1.OperationType{
-					admissionregistrationv1beta1.Create,
-					admissionregistrationv1beta1.Update,
-				},
-				Rule: admissionregistrationv1beta1.Rule{
-					APIGroups:   []string{v1.GroupName},
-					APIVersions: []string{v1.VirtualMachineInstanceReplicaSetGroupVersionKind.Version},
-					Resources:   []string{"virtualmachineinstancereplicasets"},
-				},
-			}},
-			ClientConfig: admissionregistrationv1beta1.WebhookClientConfig{
-				Service: &admissionregistrationv1beta1.ServiceReference{
-					Namespace: app.namespace,
-					Name:      virtApiServiceName,
-					Path:      &vmirsPath,
-				},
-				CABundle: app.signingCertBytes,
-			},
-		},
-		{
-			Name:          "virtualmachinepreset-validator.kubevirt.io",
-			FailurePolicy: &failurePolicy,
-			Rules: []admissionregistrationv1beta1.RuleWithOperations{{
-				Operations: []admissionregistrationv1beta1.OperationType{
-					admissionregistrationv1beta1.Create,
-					admissionregistrationv1beta1.Update,
-				},
-				Rule: admissionregistrationv1beta1.Rule{
-					APIGroups:   []string{v1.GroupName},
-					APIVersions: []string{v1.VirtualMachineInstancePresetGroupVersionKind.Version},
-					Resources:   []string{"virtualmachineinstancepresets"},
-				},
-			}},
-			ClientConfig: admissionregistrationv1beta1.WebhookClientConfig{
-				Service: &admissionregistrationv1beta1.ServiceReference{
-					Namespace: app.namespace,
-					Name:      virtApiServiceName,
-					Path:      &vmipresetPath,
-				},
-				CABundle: app.signingCertBytes,
-			},
-		},
-		{
-			Name:          "migration-create-validator.kubevirt.io",
-			FailurePolicy: &failurePolicy,
-			Rules: []admissionregistrationv1beta1.RuleWithOperations{{
-				Operations: []admissionregistrationv1beta1.OperationType{
-					admissionregistrationv1beta1.Create,
-				},
-				Rule: admissionregistrationv1beta1.Rule{
-					APIGroups:   []string{v1.GroupName},
-					APIVersions: []string{v1.VirtualMachineInstanceMigrationGroupVersionKind.Version},
-					Resources:   []string{"virtualmachineinstancemigrations"},
-				},
-			}},
-			ClientConfig: admissionregistrationv1beta1.WebhookClientConfig{
-				Service: &admissionregistrationv1beta1.ServiceReference{
-					Namespace: app.namespace,
-					Name:      virtApiServiceName,
-					Path:      &migrationCreatePath,
-				},
-				CABundle: app.signingCertBytes,
-			},
-		},
-		{
-			Name:          "migration-update-validator.kubevirt.io",
-			FailurePolicy: &failurePolicy,
-			Rules: []admissionregistrationv1beta1.RuleWithOperations{{
-				Operations: []admissionregistrationv1beta1.OperationType{
-					admissionregistrationv1beta1.Update,
-				},
-				Rule: admissionregistrationv1beta1.Rule{
-					APIGroups:   []string{v1.GroupName},
-					APIVersions: []string{v1.VirtualMachineInstanceMigrationGroupVersionKind.Version},
-					Resources:   []string{"virtualmachineinstancemigrations"},
-				},
-			}},
-			ClientConfig: admissionregistrationv1beta1.WebhookClientConfig{
-				Service: &admissionregistrationv1beta1.ServiceReference{
-					Namespace: app.namespace,
-					Name:      virtApiServiceName,
-					Path:      &migrationUpdatePath,
-				},
-				CABundle: app.signingCertBytes,
-			},
-		},
-	}
-
-	return webHooks
-}
-
-func (app *virtAPIApp) createValidatingWebhook() error {
-	registerWebhook := false
-	webhookRegistration, err := app.virtCli.AdmissionregistrationV1beta1().ValidatingWebhookConfigurations().Get(virtWebhookValidator, metav1.GetOptions{})
-	if err != nil {
-		if k8serrors.IsNotFound(err) {
-			fmt.Println(err)
-			registerWebhook = true
-		} else {
-			return err
-		}
-	}
-	webHooks := app.validatingWebhooks()
-
-	if registerWebhook {
-		_, err := app.virtCli.AdmissionregistrationV1beta1().ValidatingWebhookConfigurations().Create(&admissionregistrationv1beta1.ValidatingWebhookConfiguration{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: virtWebhookValidator,
-				Labels: map[string]string{
-					v1.AppLabel: virtWebhookValidator,
-				},
-			},
-			Webhooks: webHooks,
-		})
-		if err != nil {
-			return err
-		}
-	} else {
-		for _, webhook := range webhookRegistration.Webhooks {
-			if webhook.ClientConfig.Service != nil && webhook.ClientConfig.Service.Namespace != app.namespace {
-				return fmt.Errorf("ValidatingAdmissionWebhook [%s] is already registered using services endpoints in a different namespace. Existing webhook registration must be deleted before virt-api can proceed.", virtWebhookValidator)
-			}
-		}
-
-		// update registered webhook with our data
-		webhookRegistration.Webhooks = webHooks
-
-		_, err := app.virtCli.AdmissionregistrationV1beta1().ValidatingWebhookConfigurations().Update(webhookRegistration)
-		if err != nil {
-			return err
-		}
-	}
-
-	http.HandleFunc(vmiCreateValidatePath, func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc(components.VMICreateValidatePath, func(w http.ResponseWriter, r *http.Request) {
 		validating_webhook.ServeVMICreate(w, r, app.clusterConfig)
 	})
-	http.HandleFunc(vmiUpdateValidatePath, func(w http.ResponseWriter, r *http.Request) {
-		validating_webhook.ServeVMIUpdate(w, r)
+	http.HandleFunc(components.VMIUpdateValidatePath, func(w http.ResponseWriter, r *http.Request) {
+		validating_webhook.ServeVMIUpdate(w, r, app.clusterConfig)
 	})
-	http.HandleFunc(vmValidatePath, func(w http.ResponseWriter, r *http.Request) {
-		validating_webhook.ServeVMs(w, r, app.clusterConfig)
+	http.HandleFunc(components.VMValidatePath, func(w http.ResponseWriter, r *http.Request) {
+		validating_webhook.ServeVMs(w, r, app.clusterConfig, app.virtCli, informers)
 	})
-	http.HandleFunc(vmirsValidatePath, func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc(components.VMIRSValidatePath, func(w http.ResponseWriter, r *http.Request) {
 		validating_webhook.ServeVMIRS(w, r, app.clusterConfig)
 	})
-	http.HandleFunc(vmipresetValidatePath, func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc(components.VMPoolValidatePath, func(w http.ResponseWriter, r *http.Request) {
+		validating_webhook.ServeVMPool(w, r, app.clusterConfig)
+	})
+	http.HandleFunc(components.VMIPresetValidatePath, func(w http.ResponseWriter, r *http.Request) {
 		validating_webhook.ServeVMIPreset(w, r)
 	})
-	http.HandleFunc(migrationCreateValidatePath, func(w http.ResponseWriter, r *http.Request) {
-		validating_webhook.ServeMigrationCreate(w, r, app.clusterConfig)
+	http.HandleFunc(components.MigrationCreateValidatePath, func(w http.ResponseWriter, r *http.Request) {
+		validating_webhook.ServeMigrationCreate(w, r, app.clusterConfig, app.virtCli)
 	})
-	http.HandleFunc(migrationUpdateValidatePath, func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc(components.MigrationUpdateValidatePath, func(w http.ResponseWriter, r *http.Request) {
 		validating_webhook.ServeMigrationUpdate(w, r)
 	})
-
-	return nil
-}
-
-func (app *virtAPIApp) mutatingWebhooks() []admissionregistrationv1beta1.Webhook {
-	vmiPath := vmiMutatePath
-	migrationPath := migrationMutatePath
-	webHooks := []admissionregistrationv1beta1.Webhook{
-		{
-			Name: "virtualmachineinstances-mutator.kubevirt.io",
-			Rules: []admissionregistrationv1beta1.RuleWithOperations{{
-				Operations: []admissionregistrationv1beta1.OperationType{
-					admissionregistrationv1beta1.Create,
-				},
-				Rule: admissionregistrationv1beta1.Rule{
-					APIGroups:   []string{v1.GroupName},
-					APIVersions: []string{v1.VirtualMachineInstanceGroupVersionKind.Version},
-					Resources:   []string{"virtualmachineinstances"},
-				},
-			}},
-			ClientConfig: admissionregistrationv1beta1.WebhookClientConfig{
-				Service: &admissionregistrationv1beta1.ServiceReference{
-					Namespace: app.namespace,
-					Name:      virtApiServiceName,
-					Path:      &vmiPath,
-				},
-				CABundle: app.signingCertBytes,
-			},
-		},
-		{
-			Name: "migrations-mutator.kubevirt.io",
-			Rules: []admissionregistrationv1beta1.RuleWithOperations{{
-				Operations: []admissionregistrationv1beta1.OperationType{
-					admissionregistrationv1beta1.Create,
-				},
-				Rule: admissionregistrationv1beta1.Rule{
-					APIGroups:   []string{v1.GroupName},
-					APIVersions: []string{v1.VirtualMachineInstanceMigrationGroupVersionKind.Version},
-					Resources:   []string{"virtualmachineinstancemigrations"},
-				},
-			}},
-			ClientConfig: admissionregistrationv1beta1.WebhookClientConfig{
-				Service: &admissionregistrationv1beta1.ServiceReference{
-					Namespace: app.namespace,
-					Name:      virtApiServiceName,
-					Path:      &migrationPath,
-				},
-				CABundle: app.signingCertBytes,
-			},
-		},
-	}
-	return webHooks
-}
-
-func (app *virtAPIApp) createMutatingWebhook() error {
-	registerWebhook := false
-
-	webhookRegistration, err := app.virtCli.AdmissionregistrationV1beta1().MutatingWebhookConfigurations().Get(virtWebhookMutator, metav1.GetOptions{})
-	if err != nil {
-		if k8serrors.IsNotFound(err) {
-			registerWebhook = true
-		} else {
-			return err
-		}
-	}
-	webHooks := app.mutatingWebhooks()
-
-	if registerWebhook {
-		_, err := app.virtCli.AdmissionregistrationV1beta1().MutatingWebhookConfigurations().Create(&admissionregistrationv1beta1.MutatingWebhookConfiguration{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: virtWebhookMutator,
-				Labels: map[string]string{
-					v1.AppLabel: virtWebhookMutator,
-				},
-			},
-			Webhooks: webHooks,
-		})
-		if err != nil {
-			return err
-		}
-	} else {
-
-		for _, webhook := range webhookRegistration.Webhooks {
-			if webhook.ClientConfig.Service != nil && webhook.ClientConfig.Service.Namespace != app.namespace {
-				return fmt.Errorf("MutatingAdmissionWebhook [%s] is already registered using services endpoints in a different namespace. Existing webhook registration must be deleted before virt-api can proceed.", virtWebhookMutator)
-			}
-		}
-
-		// update registered webhook with our data
-		webhookRegistration.Webhooks = webHooks
-
-		_, err := app.virtCli.AdmissionregistrationV1beta1().MutatingWebhookConfigurations().Update(webhookRegistration)
-		if err != nil {
-			return err
-		}
-	}
-
-	http.HandleFunc(vmiMutatePath, func(w http.ResponseWriter, r *http.Request) {
-		mutating_webhook.ServeVMIs(w, r, app.clusterConfig)
+	http.HandleFunc(components.VMSnapshotValidatePath, func(w http.ResponseWriter, r *http.Request) {
+		validating_webhook.ServeVMSnapshots(w, r, app.clusterConfig, app.virtCli)
 	})
-	http.HandleFunc(migrationMutatePath, func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc(components.VMRestoreValidatePath, func(w http.ResponseWriter, r *http.Request) {
+		validating_webhook.ServeVMRestores(w, r, app.clusterConfig, app.virtCli, informers)
+	})
+	http.HandleFunc(components.VMExportValidatePath, func(w http.ResponseWriter, r *http.Request) {
+		validating_webhook.ServeVMExports(w, r, app.clusterConfig)
+	})
+	http.HandleFunc(components.VMInstancetypeValidatePath, func(w http.ResponseWriter, r *http.Request) {
+		validating_webhook.ServeVmInstancetypes(w, r, app.clusterConfig, app.virtCli)
+	})
+	http.HandleFunc(components.VMClusterInstancetypeValidatePath, func(w http.ResponseWriter, r *http.Request) {
+		validating_webhook.ServeVmClusterInstancetypes(w, r, app.clusterConfig, app.virtCli)
+	})
+	http.HandleFunc(components.VMPreferenceValidatePath, func(w http.ResponseWriter, r *http.Request) {
+		validating_webhook.ServeVmPreferences(w, r, app.clusterConfig, app.virtCli)
+	})
+	http.HandleFunc(components.VMClusterPreferenceValidatePath, func(w http.ResponseWriter, r *http.Request) {
+		validating_webhook.ServeVmClusterPreferences(w, r, app.clusterConfig, app.virtCli)
+	})
+	http.HandleFunc(components.StatusValidatePath, func(w http.ResponseWriter, r *http.Request) {
+		validating_webhook.ServeStatusValidation(w, r, app.clusterConfig, app.virtCli, informers)
+	})
+	http.HandleFunc(components.LauncherEvictionValidatePath, func(w http.ResponseWriter, r *http.Request) {
+		validating_webhook.ServePodEvictionInterceptor(w, r, app.clusterConfig, app.virtCli)
+	})
+	http.HandleFunc(components.MigrationPolicyCreateValidatePath, func(w http.ResponseWriter, r *http.Request) {
+		validating_webhook.ServeMigrationPolicies(w, r, app.clusterConfig, app.virtCli)
+	})
+	http.HandleFunc(components.VMCloneCreateValidatePath, func(w http.ResponseWriter, r *http.Request) {
+		validating_webhook.ServeVirtualMachineClones(w, r, app.clusterConfig, app.virtCli)
+	})
+}
+
+func (app *virtAPIApp) registerMutatingWebhook(informers *webhooks.Informers) {
+
+	http.HandleFunc(components.VMMutatePath, func(w http.ResponseWriter, r *http.Request) {
+		mutating_webhook.ServeVMs(w, r, app.clusterConfig, app.virtCli)
+	})
+	http.HandleFunc(components.VMIMutatePath, func(w http.ResponseWriter, r *http.Request) {
+		mutating_webhook.ServeVMIs(w, r, app.clusterConfig, informers, app.kubeVirtServiceAccounts)
+	})
+	http.HandleFunc(components.MigrationMutatePath, func(w http.ResponseWriter, r *http.Request) {
 		mutating_webhook.ServeMigrationCreate(w, r)
 	})
-	return nil
+	http.HandleFunc(components.VMCloneCreateMutatePath, func(w http.ResponseWriter, r *http.Request) {
+		mutating_webhook.ServeClones(w, r)
+	})
 }
 
-func (app *virtAPIApp) subresourceApiservice() *apiregistrationv1beta1.APIService {
+func (app *virtAPIApp) setupTLS(k8sCAManager kvtls.ClientCAManager, kubevirtCAManager kvtls.ClientCAManager) {
 
-	subresourceAggregatedApiName := v1.SubresourceGroupVersion.Version + "." + v1.SubresourceGroupName
-
-	return &apiregistrationv1beta1.APIService{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      subresourceAggregatedApiName,
-			Namespace: app.namespace,
-			Labels: map[string]string{
-				v1.AppLabel: "virt-api-aggregator",
-			},
-		},
-		Spec: apiregistrationv1beta1.APIServiceSpec{
-			Service: &apiregistrationv1beta1.ServiceReference{
-				Namespace: app.namespace,
-				Name:      virtApiServiceName,
-			},
-			Group:                v1.SubresourceGroupName,
-			Version:              v1.SubresourceGroupVersion.Version,
-			CABundle:             app.signingCertBytes,
-			GroupPriorityMinimum: 1000,
-			VersionPriority:      15,
-		},
-	}
-
+	// A VerifyClientCertIfGiven request means we're not guaranteed
+	// a client has been authenticated unless they provide a peer
+	// cert.
+	//
+	// Make sure to verify in subresource endpoint that peer cert
+	// was provided before processing request. If the peer cert is
+	// given on the connection, then we can be guaranteed that it
+	// was signed by the client CA in our pool.
+	//
+	// There is another ClientAuth type called 'RequireAndVerifyClientCert'
+	// We can't use this type here because during the aggregated api status
+	// check it attempts to hit '/' on our api endpoint to verify an http
+	// response is given. That status request won't send a peer cert regardless
+	// if the TLS handshake requests it. As a result, the TLS handshake fails
+	// and our aggregated endpoint never becomes available.
+	app.tlsConfig = kvtls.SetupTLSWithCertManager(k8sCAManager, app.certmanager, tls.VerifyClientCertIfGiven, app.clusterConfig)
+	app.handlerTLSConfiguration = kvtls.SetupTLSForVirtHandlerClients(kubevirtCAManager, app.handlerCertManager, app.externallyManaged)
 }
 
-func (app *virtAPIApp) createSubresourceApiservice() error {
-
-	subresourceApiservice := app.subresourceApiservice()
-
-	registerApiService := false
-
-	apiService, err := app.aggregatorClient.ApiregistrationV1beta1().APIServices().Get(subresourceApiservice.Name, metav1.GetOptions{})
-	if err != nil {
-		if k8serrors.IsNotFound(err) {
-			registerApiService = true
-		} else {
-			return err
-		}
-	}
-
-	if registerApiService {
-		_, err = app.aggregatorClient.ApiregistrationV1beta1().APIServices().Create(app.subresourceApiservice())
-		if err != nil {
-			return err
-		}
-	} else {
-		if apiService.Spec.Service != nil && apiService.Spec.Service.Namespace != app.namespace {
-			return fmt.Errorf("apiservice [%s] is already registered in a different namespace. Existing apiservice registration must be deleted before virt-api can proceed.", subresourceApiservice.Name)
-		}
-
-		// Always update spec to latest.
-		apiService.Spec = app.subresourceApiservice().Spec
-		_, err := app.aggregatorClient.ApiregistrationV1beta1().APIServices().Update(apiService)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (app *virtAPIApp) setupTLS(caManager ClientCAManager) error {
-
-	certPair, err := tls.X509KeyPair(app.certBytes, app.keyBytes)
-	if err != nil {
-		return fmt.Errorf("some special error: %b", err)
-	}
-
-	app.tlsConfig = &tls.Config{
-		Certificates: []tls.Certificate{certPair},
-		GetConfigForClient: func(hi *tls.ClientHelloInfo) (*tls.Config, error) {
-
-			pool, err := caManager.GetCurrent()
-			if err != nil {
-				log.Log.Reason(err).Error("Failed to get requestheader client CA")
-				return nil, err
-			}
-			config := &tls.Config{
-				Certificates: []tls.Certificate{certPair},
-				ClientCAs:    pool,
-				// A VerifyClientCertIfGiven request means we're not guaranteed
-				// a client has been authenticated unless they provide a peer
-				// cert.
-				//
-				// Make sure to verify in subresource endpoint that peer cert
-				// was provided before processing request. If the peer cert is
-				// given on the connection, then we can be guaranteed that it
-				// was signed by the client CA in our pool.
-				//
-				// There is another ClientAuth type called 'RequireAndVerifyClientCert'
-				// We can't use this type here because during the aggregated api status
-				// check it attempts to hit '/' on our api endpoint to verify an http
-				// response is given. That status request won't send a peer cert regardless
-				// if the TLS handshake requests it. As a result, the TLS handshake fails
-				// and our aggregated endpoint never becomes available.
-				ClientAuth: tls.VerifyClientCertIfGiven,
-			}
-
-			config.BuildNameToCertificate()
-			return config, nil
-		},
-	}
-	app.tlsConfig.BuildNameToCertificate()
-	return nil
-}
-
-func (app *virtAPIApp) startTLS(stopCh <-chan struct{}) error {
+func (app *virtAPIApp) startTLS(informerFactory controller.KubeInformerFactory) error {
 
 	errors := make(chan error)
+	c := make(chan os.Signal, 1)
 
-	informerFactory := controller.NewKubeInformerFactory(app.virtCli.RestClient(), app.virtCli, app.namespace)
+	signal.Notify(c, os.Interrupt,
+		syscall.SIGHUP,
+		syscall.SIGINT,
+		syscall.SIGTERM,
+		syscall.SIGQUIT,
+	)
 
 	authConfigMapInformer := informerFactory.ApiAuthConfigMap()
-	informerFactory.Start(stopCh)
+	kubevirtCAConfigInformer := informerFactory.KubeVirtCAConfigMap()
 
-	cache.WaitForCacheSync(stopCh, authConfigMapInformer.HasSynced)
+	k8sCAManager := kvtls.NewKubernetesClientCAManager(authConfigMapInformer.GetStore())
+	kubevirtCAInformer := kvtls.NewCAManager(kubevirtCAConfigInformer.GetStore(), app.namespace, app.caConfigMapName)
+	app.setupTLS(k8sCAManager, kubevirtCAInformer)
 
-	caManager := NewClientCAManager(authConfigMapInformer.GetStore())
+	app.Compose()
 
-	err := app.setupTLS(caManager)
-	if err != nil {
-		return err
+	http.Handle("/metrics", promhttp.Handler())
+	server := &http.Server{
+		Addr:      fmt.Sprintf("%s:%d", app.BindAddress, app.Port),
+		TLSConfig: app.tlsConfig,
+		// Disable HTTP/2
+		// See CVE-2023-44487
+		TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){},
 	}
 
 	// start TLS server
 	go func() {
-		http.Handle("/metrics", promhttp.Handler())
-
-		server := &http.Server{
-			Addr:      fmt.Sprintf("%s:%d", app.BindAddress, app.Port),
-			TLSConfig: app.tlsConfig,
-		}
-
 		errors <- server.ListenAndServeTLS("", "")
 	}()
 
+	// start graceful shutdown handler
+	go func() {
+		select {
+		case s := <-c:
+			log.Log.Infof("Received signal %s, initiating graceful shutdown", s.String())
+		case msg := <-app.reInitChan:
+			log.Log.Infof("Received signal to reInitialize virt-api [%s], initiating graceful shutdown", msg)
+		}
+
+		// pause briefly to ensure the load balancer has had a chance to
+		// remove this endpoint from rotation due to pod.DeletionTimestamp != nil
+		// By pausing, we reduce the chance that the load balancer will attempt to
+		// route new requests to the service after we've started the shutdown
+		// procedure
+		time.Sleep(5 * time.Second)
+
+		// by default, server.Shutdown() waits indefinitely for all existing
+		// connections to close. We need to give this a timeout to ensure the
+		// shutdown will eventually complete.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer func() {
+			cancel()
+		}()
+
+		// Shutdown means new connections are not permitted and it waits for existing
+		// connections to terminate (up to the context timeout)
+		server.Shutdown(ctx)
+		// Shutdown forces any existing connections that persist after the shutdown
+		// times out to be forced closed.
+		server.Close()
+	}()
+
 	// wait for server to exit
-	return <-errors
+	err := <-errors
+
+	if err != nil && err != http.ErrServerClosed {
+		// ErrServerClosed is an expected error during normal shutdown
+		return err
+	}
+	return nil
 }
 
 func (app *virtAPIApp) Run() {
+	host, err := os.Hostname()
+	if err != nil {
+		panic(fmt.Errorf("unable to get hostname: %v", err))
+	}
+	app.host = host
+
 	// get client Cert
-	err := app.readRequestHeader()
+	err = app.readRequestHeader()
 	if err != nil {
 		panic(err)
 	}
 
 	// Get/Set selfsigned cert
-	err = app.getSelfSignedCert()
-	if err != nil {
-		panic(err)
-	}
-
-	// Verify/create aggregator endpoint.
-	err = app.createSubresourceApiservice()
-	if err != nil {
-		panic(err)
-	}
+	app.prepareCertManager()
 
 	// Run informers for webhooks usage
-	webhookInformers := webhooks.GetInformers()
-	kubeInformerFactory := controller.NewKubeInformerFactory(app.virtCli.RestClient(), app.virtCli, app.namespace)
-	configMapInformer := kubeInformerFactory.ConfigMap()
+	kubeInformerFactory := controller.NewKubeInformerFactory(app.virtCli.RestClient(), app.virtCli, app.aggregatorClient, app.namespace)
+
+	kubeVirtInformer := kubeInformerFactory.KubeVirt()
+	// Wire up health check trigger
+	kubeVirtInformer.SetWatchErrorHandler(func(r *cache.Reflector, err error) {
+		apiHealthVersion.Clear()
+		cache.DefaultWatchErrorHandler(r, err)
+	})
+
+	kubeInformerFactory.ApiAuthConfigMap()
+	kubeInformerFactory.KubeVirtCAConfigMap()
+	crdInformer := kubeInformerFactory.CRD()
+	vmiPresetInformer := kubeInformerFactory.VirtualMachinePreset()
+	vmRestoreInformer := kubeInformerFactory.VirtualMachineRestore()
+	namespaceInformer := kubeInformerFactory.Namespace()
 
 	stopChan := make(chan struct{}, 1)
 	defer close(stopChan)
-	go webhookInformers.VMIInformer.Run(stopChan)
-	go webhookInformers.VMIPresetInformer.Run(stopChan)
-	go webhookInformers.NamespaceLimitsInformer.Run(stopChan)
-	go configMapInformer.Run(stopChan)
+	kubeInformerFactory.Start(stopChan)
+	kubeInformerFactory.WaitForCacheSync(stopChan)
 
-	cache.WaitForCacheSync(stopChan,
-		webhookInformers.VMIInformer.HasSynced,
-		webhookInformers.VMIPresetInformer.HasSynced,
-		webhookInformers.NamespaceLimitsInformer.HasSynced,
-		configMapInformer.HasSynced)
-
-	app.clusterConfig = virtconfig.NewClusterConfig(configMapInformer, app.namespace)
-
-	// Verify/create webhook endpoint.
-	err = app.createWebhook()
+	app.clusterConfig, err = virtconfig.NewClusterConfig(crdInformer, kubeVirtInformer, app.namespace)
 	if err != nil {
 		panic(err)
 	}
+	app.hasCDIDataSource = app.clusterConfig.HasDataSourceAPI()
+	app.clusterConfig.SetConfigModifiedCallback(app.configModificationCallback)
+	app.clusterConfig.SetConfigModifiedCallback(app.shouldChangeLogVerbosity)
+	app.clusterConfig.SetConfigModifiedCallback(app.shouldChangeRateLimiter)
+
+	var dataSourceInformer cache.SharedIndexInformer
+	if app.hasCDIDataSource {
+		dataSourceInformer = kubeInformerFactory.DataSource()
+		log.Log.Infof("CDI detected, DataSource integration enabled")
+	} else {
+		// Add a dummy DataSource informer in the event datasource support
+		// is disabled. This lets the controller continue to work without
+		// requiring a separate branching code path.
+		dataSourceInformer = kubeInformerFactory.DummyDataSource()
+		log.Log.Infof("CDI not detected, DataSource integration disabled")
+	}
+
+	// It is safe to call kubeInformerFactory.Start multiple times.
+	// The function is idempotent and will only start the informers that
+	// have not been started yet
+	kubeInformerFactory.Start(stopChan)
+	kubeInformerFactory.WaitForCacheSync(stopChan)
+
+	webhookInformers := &webhooks.Informers{
+		VMIPresetInformer:  vmiPresetInformer,
+		VMRestoreInformer:  vmRestoreInformer,
+		DataSourceInformer: dataSourceInformer,
+		NamespaceInformer:  namespaceInformer,
+	}
+
+	// Build webhook subresources
+	app.registerMutatingWebhook(webhookInformers)
+	app.registerValidatingWebhooks(webhookInformers)
+
+	go app.certmanager.Start()
+	go app.handlerCertManager.Start()
 
 	// start TLS server
-	err = app.startTLS(stopChan)
+	// tls server will only accept connections when fetching a certificate and internal configuration passed once
+	err = app.startTLS(kubeInformerFactory)
 	if err != nil {
 		panic(err)
 	}
+
+}
+
+// Detects if a config has been applied that requires
+// re-initializing virt-api.
+func (app *virtAPIApp) configModificationCallback() {
+	newHasCDI := app.clusterConfig.HasDataSourceAPI()
+	if newHasCDI != app.hasCDIDataSource {
+		if newHasCDI {
+			log.Log.Infof("Reinitialize virt-api, cdi DataSource api has been introduced")
+		} else {
+			log.Log.Infof("Reinitialize virt-api, cdi DataSource api has been removed")
+		}
+		app.reInitChan <- "reinit due to CDI api change"
+	}
+}
+
+// Update virt-api log verbosity on relevant config changes
+func (app *virtAPIApp) shouldChangeLogVerbosity() {
+	verbosity := app.clusterConfig.GetVirtAPIVerbosity(app.host)
+	log.Log.SetVerbosityLevel(int(verbosity))
+	log.Log.V(2).Infof("set log verbosity to %d", verbosity)
+}
+
+// Update virt-handler rate limiter
+func (app *virtAPIApp) shouldChangeRateLimiter() {
+	config := app.clusterConfig.GetConfig()
+	qps := config.APIConfiguration.RestClient.RateLimiter.TokenBucketRateLimiter.QPS
+	burst := config.APIConfiguration.RestClient.RateLimiter.TokenBucketRateLimiter.Burst
+	app.reloadableRateLimiter.Set(flowcontrol.NewTokenBucketRateLimiter(qps, burst))
+	log.Log.V(2).Infof("setting rate limiter for the API to %v QPS and %v Burst", qps, burst)
+	qps = config.WebhookConfiguration.RestClient.RateLimiter.TokenBucketRateLimiter.QPS
+	burst = config.WebhookConfiguration.RestClient.RateLimiter.TokenBucketRateLimiter.Burst
+	app.reloadableWebhookRateLimiter.Set(flowcontrol.NewTokenBucketRateLimiter(qps, burst))
+	log.Log.V(2).Infof("setting rate limiter for webhooks to %v QPS and %v Burst", qps, burst)
 }
 
 func (app *virtAPIApp) AddFlags() {
@@ -1069,4 +1172,48 @@ func (app *virtAPIApp) AddFlags() {
 		"swagger-ui location")
 	flag.BoolVar(&app.SubresourcesOnly, "subresources-only", false,
 		"Only serve subresource endpoints")
+	flag.IntVar(&app.consoleServerPort, "console-server-port", DefaultConsoleServerPort,
+		"The port virt-handler listens on for console requests")
+	flag.StringVar(&app.caConfigMapName, "ca-configmap-name", defaultCAConfigMapName,
+		"The name of configmap containing CA certificates to authenticate requests presenting client certificates with matching CommonName")
+	flag.StringVar(&app.tlsCertFilePath, "tls-cert-file", defaultTlsCertFilePath,
+		"File containing the default x509 Certificate for HTTPS")
+	flag.StringVar(&app.tlsKeyFilePath, "tls-key-file", defaultTlsKeyFilePath,
+		"File containing the default x509 private key matching --tls-cert-file")
+	flag.StringVar(&app.handlerCertFilePath, "handler-cert-file", defaultHandlerCertFilePath,
+		"Client certificate used to prove the identity of the virt-api when it must call virt-handler during a request")
+	flag.StringVar(&app.handlerKeyFilePath, "handler-key-file", defaultHandlerKeyFilePath,
+		"Private key for the client certificate used to prove the identity of the virt-api when it must call virt-handler during a request")
+	flag.BoolVar(&app.externallyManaged, "externally-managed", false,
+		"Allow intermediate certificates to be used in building up the chain of trust when certificates are externally managed")
+}
+
+// GetGsInfo returns the libguestfs-tools image information based on the KubeVirt installation in the namespace.
+func (app *virtAPIApp) GetGsInfo() func(_ *restful.Request, response *restful.Response) {
+	return func(_ *restful.Request, response *restful.Response) {
+		var kvConfig virtoperatorutils.KubeVirtDeploymentConfig
+		kv := app.clusterConfig.GetConfigFromKubeVirtCR()
+		if kv == nil {
+			error_guestfs(fmt.Errorf("Failed getting KubeVirt config"), response)
+		}
+		err := json.Unmarshal([]byte(kv.Status.ObservedDeploymentConfig), &kvConfig)
+		if err != nil {
+			error_guestfs(err, response)
+			return
+		}
+		response.WriteAsJson(kubecli.GuestfsInfo{
+			Registry:    kv.Status.ObservedKubeVirtRegistry,
+			Tag:         kv.Status.ObservedKubeVirtVersion,
+			Digest:      kvConfig.GsSha,
+			ImagePrefix: kvConfig.GetImagePrefix(),
+			GsImage:     kvConfig.GsImage,
+		})
+		return
+	}
+}
+
+func error_guestfs(err error, response *restful.Response) {
+	res := map[string]interface{}{}
+	res["guestfs"] = map[string]interface{}{"status": "failed", "error": fmt.Sprintf("%v", err)}
+	response.WriteHeaderAndJson(http.StatusInternalServerError, res, restful.MIME_JSON)
 }

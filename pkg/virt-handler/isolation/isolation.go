@@ -28,179 +28,273 @@ package isolation
 import (
 	"bufio"
 	"fmt"
-	"net"
 	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
-	"syscall"
 
-	v1 "kubevirt.io/kubevirt/pkg/api/v1"
-	"kubevirt.io/kubevirt/pkg/log"
-	cmdclient "kubevirt.io/kubevirt/pkg/virt-handler/cmd-client"
+	"kubevirt.io/kubevirt/pkg/unsafepath"
+
+	ps "github.com/mitchellh/go-ps"
+	mount "github.com/moby/sys/mountinfo"
+
+	"kubevirt.io/kubevirt/pkg/safepath"
+
+	"kubevirt.io/client-go/log"
+
+	"kubevirt.io/kubevirt/pkg/util"
 )
 
-// PodIsolationDetector helps detecting cgroups, namespaces and PIDs of Pods from outside of them.
-// Different strategies may be applied to do that.
-type PodIsolationDetector interface {
-	// Detect takes a vm, looks up a socket based the VM and detects pid, cgroups and namespaces of the owner of that socket.
-	// It returns an IsolationResult containing all isolation information
-	Detect(vm *v1.VirtualMachineInstance) (*IsolationResult, error)
-
-	// Whitelist allows specifying cgroup controller which should be considered to detect the cgroup slice
-	// It returns a PodIsolationDetector to allow configuring the PodIsolationDetector via the builder pattern.
-	Whitelist(controller []string) PodIsolationDetector
+// IsolationResult is the result of a successful PodIsolationDetector.Detect
+type IsolationResult interface {
+	// process ID
+	Pid() int
+	// parent process ID
+	PPid() int
+	// full path to the process namespace
+	PIDNamespace() string
+	// full path to the process root mount
+	MountRoot() (*safepath.Path, error)
+	// full path to the mount namespace
+	MountNamespace() string
+	// mounts for the process
+	Mounts(mount.FilterFunc) ([]*mount.Info, error)
+	// returns the QEMU process
+	GetQEMUProcess() (ps.Process, error)
+	// returns the KVM PIT pid
+	KvmPitPid() (int, error)
 }
 
-type socketBasedIsolationDetector struct {
-	socketDir  string
-	controller []string
+type RealIsolationResult struct {
+	pid  int
+	ppid int
 }
 
-// NewSocketBasedIsolationDetector takes socketDir and creates a socket based IsolationDetector
-// It returns a PodIsolationDetector which detects pid, cgroups and namespaces of the socket owner.
-func NewSocketBasedIsolationDetector(socketDir string) PodIsolationDetector {
-	return &socketBasedIsolationDetector{socketDir: socketDir, controller: []string{"devices"}}
+func NewIsolationResult(pid, ppid int) IsolationResult {
+	return &RealIsolationResult{pid: pid, ppid: ppid}
 }
 
-func (s *socketBasedIsolationDetector) Whitelist(controller []string) PodIsolationDetector {
-	s.controller = controller
-	return s
-}
-
-func (s *socketBasedIsolationDetector) Detect(vm *v1.VirtualMachineInstance) (*IsolationResult, error) {
-	var pid int
-	var slice string
-	var err error
-	var controller []string
-
-	// Look up the socket of the virt-launcher Pod which was created for that VM, and extract the PID from it
-	socket := cmdclient.SocketFromUID(s.socketDir, string(vm.UID))
-	if pid, err = s.getPid(socket); err != nil {
-		log.Log.Object(vm).Reason(err).Errorf("Could not get owner Pid of socket %s", socket)
-		return nil, err
-
-	}
-
-	// Look up the cgroup slice based on the whitelisted controller
-	if controller, slice, err = s.getSlice(pid); err != nil {
-		log.Log.Object(vm).Reason(err).Errorf("Could not get cgroup slice for Pid %d", pid)
-		return nil, err
-	}
-
-	return NewIsolationResult(pid, slice, controller), nil
-}
-
-func NewIsolationResult(pid int, slice string, controller []string) *IsolationResult {
-	return &IsolationResult{pid: pid, slice: slice, controller: controller}
-}
-
-type IsolationResult struct {
-	pid        int
-	slice      string
-	controller []string
-}
-
-func (r *IsolationResult) Slice() string {
-	return r.slice
-}
-
-func (r *IsolationResult) PIDNamespace() string {
+func (r *RealIsolationResult) PIDNamespace() string {
 	return fmt.Sprintf("/proc/%d/ns/pid", r.pid)
 }
 
-func (r *IsolationResult) NetNamespace() string {
-	return fmt.Sprintf("/proc/%d/ns/net", r.pid)
+func (r *RealIsolationResult) MountNamespace() string {
+	return fmt.Sprintf("/proc/%d/ns/mnt", r.pid)
 }
 
-func (r *IsolationResult) MountRoot() string {
-	return fmt.Sprintf("/proc/%d/root", r.pid)
+// IsMounted checks if the given path is a mount point or not.
+func IsMounted(mountPoint *safepath.Path) (isMounted bool, err error) {
+	// Ensure that the path is still a valid absolute path without symlinks
+	f, err := safepath.OpenAtNoFollow(mountPoint)
+	if err != nil {
+		// treat ErrNotExist as error too
+		// since the inherent property of a safepath.Path is that the path must
+		// have existed at the point of object creation
+		return false, err
+	}
+	defer f.Close()
+	if mountPoint.IsRoot() {
+		// mount.Mounted has purely string matching based special logic on how to treat "/".
+		// Emulating this for safepath here without ever having to call an unsafe method on our
+		// safepath.
+		return true, nil
+	} else {
+		// TODO: Unsafe full path is required, and not a fd, since otherwise mount table lookups and such would not work.
+		return mount.Mounted(unsafepath.UnsafeAbsolute(mountPoint.Raw()))
+	}
 }
 
-func (r *IsolationResult) Pid() int {
+// IsBlockDevice checks if the given path is a block device or not.
+func IsBlockDevice(path *safepath.Path) (bool, error) {
+	fileInfo, err := safepath.StatAtNoFollow(path)
+	if err != nil {
+		return false, fmt.Errorf("error checking for block device: %v", err)
+	}
+	if fileInfo.IsDir() || (fileInfo.Mode()&os.ModeDevice) == 0 {
+		return false, nil
+	}
+	return true, nil
+}
+
+func (r *RealIsolationResult) MountRoot() (*safepath.Path, error) {
+	return safepath.JoinAndResolveWithRelativeRoot(fmt.Sprintf("/proc/%d/root", r.pid))
+}
+
+func (r *RealIsolationResult) MountRootRelative(relativePath string) (*safepath.Path, error) {
+	mountRoot, err := r.MountRoot()
+	if err != nil {
+		return nil, err
+	}
+	return mountRoot.AppendAndResolveWithRelativeRoot(relativePath)
+}
+
+func (r *RealIsolationResult) Pid() int {
 	return r.pid
 }
 
-func (r *IsolationResult) Controller() []string {
-	return r.controller
+func (r *RealIsolationResult) PPid() int {
+	return r.ppid
 }
 
-func (s *socketBasedIsolationDetector) getPid(socket string) (int, error) {
-	sock, err := net.Dial("unix", socket)
+// GetQEMUProcess encapsulates and exposes the logic to retrieve the QEMU process ID
+func (r *RealIsolationResult) GetQEMUProcess() (ps.Process, error) {
+	processes, err := ps.Processes()
 	if err != nil {
-		return -1, err
+		return nil, fmt.Errorf("failed to get all processes: %v", err)
 	}
-	defer sock.Close()
-
-	ufile, err := sock.(*net.UnixConn).File()
+	qemuProcess, err := findIsolatedQemuProcess(processes, r.PPid())
 	if err != nil {
-		return -1, err
+		return nil, err
 	}
-	// This is the tricky part, which will give us the PID of the owning socket
-	ucreds, err := syscall.GetsockoptUcred(int(ufile.Fd()), syscall.SOL_SOCKET, syscall.SO_PEERCRED)
-	if err != nil {
-		return -1, err
-	}
-
-	if int(ucreds.Pid) == 0 {
-		return -1, fmt.Errorf("The detected PID is 0. Is the isolation detector running in the host PID namespace?")
-	}
-
-	return int(ucreds.Pid), nil
+	return qemuProcess, nil
 }
 
-func (s *socketBasedIsolationDetector) getSlice(pid int) (controller []string, slice string, err error) {
-	cgroups, err := os.Open(fmt.Sprintf("/proc/%d/cgroup", pid))
+// Returns the pid of "vmpid" as seen from the first pid namespace the task
+// belongs to.
+func GetNspid(vmpid int) (int, error) {
+	fpath := filepath.Join("proc", strconv.Itoa(vmpid), "status")
+	file, err := os.Open(fpath)
 	if err != nil {
-		return
+		return 0, err
 	}
-	defer cgroups.Close()
+	defer file.Close()
 
-	scanner := bufio.NewScanner(cgroups)
+	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		cgEntry := strings.Split(scanner.Text(), ":")
-		// Check if we have a sane cgroup line
-		if len(cgEntry) != 3 {
-			err = fmt.Errorf("Could not extract slice from cgroup line: %s", scanner.Text())
-			return
-		}
-		// Skip not supported cgroup controller
-		if !sliceContains(s.controller, cgEntry[1]) {
+		line := scanner.Text()
+		if len(line) < 6 {
 			continue
 		}
-
-		// Set and check cgroup slice
-		if slice == "" {
-			slice = cgEntry[2]
-		} else if slice != cgEntry[2] {
-			err = fmt.Errorf("Process is part of more than one slice. Expected %s, found %s", slice, cgEntry[2])
-			return
+		if line[0:6] != "NSpid:" {
+			continue
 		}
-		// Add controller
-		controller = append(controller, cgEntry[1])
-	}
-	// Check if we encountered a read error
-	if scanner.Err() != nil {
-		err = scanner.Err()
-		return
+		s := strings.Fields(line)
+		if len(s) < 2 {
+			continue
+		}
+		val, err := strconv.Atoi(s[2])
+		return val, err
 	}
 
-	if slice == "" {
-		err = fmt.Errorf("Could not detect slice of whitelisted controller: %v", s.controller)
-		return
-	}
-	return
+	return -1, nil
 }
 
-func sliceContains(controllers []string, value string) bool {
-	for _, c := range controllers {
-		if c == value {
-			return true
+func (r *RealIsolationResult) KvmPitPid() (int, error) {
+	qemuprocess, err := r.GetQEMUProcess()
+	if err != nil {
+		return -1, err
+	}
+	processes, _ := ps.Processes()
+	nspid, err := GetNspid(qemuprocess.Pid())
+	if err != nil || nspid == -1 {
+		return -1, err
+	}
+	pitstr := "kvm-pit/" + strconv.Itoa(nspid)
+
+	for _, process := range processes {
+		if process.Executable() == pitstr {
+			return process.Pid(), nil
 		}
 	}
-	return false
+	return -1, nil
 }
 
-func NodeIsolationResult() *IsolationResult {
-	return &IsolationResult{
+func NodeIsolationResult() *RealIsolationResult {
+	return &RealIsolationResult{
 		pid: 1,
 	}
+}
+
+// Mounts returns mounts for the given process based on the supplied filter
+func (r *RealIsolationResult) Mounts(filter mount.FilterFunc) ([]*mount.Info, error) {
+	in, err := os.Open(fmt.Sprintf("/proc/%d/mountinfo", r.pid))
+	if err != nil {
+		return nil, fmt.Errorf("could not open file mountinfo for %d: %v", r.pid, err)
+	}
+	defer util.CloseIOAndCheckErr(in, nil)
+	return mount.GetMountsFromReader(in, filter)
+}
+
+func mountInfoFor(r IsolationResult, mountPoint string) (mountinfo *mount.Info, err error) {
+	mounts, err := r.Mounts(mount.SingleEntryFilter(mountPoint))
+	if err != nil {
+		return nil, fmt.Errorf("failed to process mountinfo for pid %d: %v", r.Pid(), err)
+	}
+	if len(mounts) <= 0 {
+		return nil, fmt.Errorf("no '%s' mount point entry found for pid %d", mountPoint, r.Pid())
+	}
+	return mounts[0], nil
+}
+
+// MountInfoRoot returns the mount information for the root mount point
+func MountInfoRoot(r IsolationResult) (mountinfo *mount.Info, err error) {
+	return mountInfoFor(r, "/")
+}
+
+func mountsFilter(compare, m *mount.Info, source string) (bool, bool) {
+	nfsMatch := false
+	if strings.Contains(m.FSType, "nfs") && compare.FSType == m.FSType {
+		nfsMatch = m.Source != source
+	}
+
+	return m.Major != compare.Major || m.Minor != compare.Minor ||
+		!strings.HasPrefix(compare.Root, m.Root) || nfsMatch, false
+}
+
+// parentMountInfoFor takes the mountInfo record of a container (child) and
+// attempts to locate a mountpoint containing it on the parent.
+func parentMountInfoFor(parent IsolationResult, mountInfo *mount.Info, source string) (*mount.Info, error) {
+	mounts, err := parent.Mounts(func(m *mount.Info) (bool, bool) {
+		return mountsFilter(mountInfo, m, source)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to find mount for %v in the mount namespace of pid %d", mountInfo.Root, parent.Pid())
+	}
+
+	if len(mounts) <= 0 {
+		return nil, fmt.Errorf("no mount containing %v found in the mount namespace of pid %d", mountInfo.Root, parent.Pid())
+	} else if len(mounts) > 1 {
+		log.Log.Infof("found %d possible mount point candidates for path %v", len(mounts), mountInfo.Root)
+		sort.SliceStable(mounts, func(i, j int) bool {
+			return len(mounts[i].Root) > len(mounts[j].Root)
+		})
+	}
+
+	return mounts[0], nil
+}
+
+func ParentPathForMount(parent IsolationResult, child IsolationResult, source, target string) (*safepath.Path, error) {
+	childMountInfo, err := mountInfoFor(child, target)
+	if err != nil {
+		return nil, err
+	}
+	parentMountInfo, err := parentMountInfoFor(parent, childMountInfo, source)
+	if err != nil {
+		return nil, err
+	}
+	parentMountRoot, err := parent.MountRoot()
+	if err != nil {
+		return nil, err
+	}
+	path := parentMountRoot
+	path, err = path.AppendAndResolveWithRelativeRoot(parentMountInfo.Mountpoint)
+	if err != nil {
+		return nil, err
+	}
+	return path.AppendAndResolveWithRelativeRoot(strings.TrimPrefix(childMountInfo.Root, parentMountInfo.Root))
+}
+
+// ParentPathForRootMount takes a container (child) and composes a path to
+// the root mount point in the context of the parent.
+func ParentPathForRootMount(parent IsolationResult, child IsolationResult) (*safepath.Path, error) {
+	return ParentPathForMount(parent, child, "", "/")
+}
+
+func SafeJoin(res IsolationResult, elems ...string) (*safepath.Path, error) {
+	mountRoot, err := res.MountRoot()
+	if err != nil {
+		return nil, err
+	}
+	return mountRoot.AppendAndResolveWithRelativeRoot(elems...)
 }

@@ -39,7 +39,7 @@ CRDs:
 
 - InstallPlan:  
   calculated list of resources to be created in order to automatically install/upgrade a CSV
-  created and insalled by the Catalog Operator, needs manual or automatic approval
+  created and installed by the Catalog Operator, needs manual or automatic approval
 
 ### Operator Marketplace
 
@@ -134,7 +134,7 @@ Travis cares for this on every release.
 
 ## Installing OLM on Kubernetes
 
-- clone the [OLM repository](github.com/operator-framework/operator-lifecycle-manager)
+- clone the [OLM repository](https://github.com/operator-framework/operator-lifecycle-manager)
 - `cd deploy/upstream/quickstart`
 - `kubectl apply -f olm.yaml`
 >**Note:** if you get an error, try again, CRD creation might have been too slow
@@ -142,16 +142,16 @@ Travis cares for this on every release.
 
 ## Installing Marketplace on Kubernetes
 
-- clone the [Marketplace repository](github.com/operator-framework/operator-marketplace)
+- clone the [Marketplace repository](https://github.com/operator-framework/operator-marketplace)
 - `cd deploy`
 - `kubectl apply -f upstream/ --validate=false`
 - check that the marketplace operator is running in the `marketplace` namespace
 ## Sources
 
-[CSV description](https://github.com/operator-framework/operator-lifecycle-manager/blob/master/Documentation/design/building-your-csv.md)  
-[CSV required fields](https://github.com/operator-framework/community-operators/blob/master/docs/required-fields.md)  
+[CSV description](https://github.com/operator-framework/operator-lifecycle-manager/blob/master/doc/design/building-your-csv.md)  
+[CSV required fields](https://github.com/operator-framework/community-operators/blob/master/docs/packaging-required-fields.md)  
 [Publish bundles](https://github.com/operator-framework/community-operators/blob/master/docs/testing-operators.md)  
-[Install OLM](https://github.com/operator-framework/operator-lifecycle-manager/blob/master/Documentation/install/install.md)  
+[Install OLM](https://github.com/operator-framework/operator-lifecycle-manager/blob/master/doc/install/install.md)  
 [Install and use Marketplace](https://github.com/operator-framework/operator-marketplace)  
 
 ## Important

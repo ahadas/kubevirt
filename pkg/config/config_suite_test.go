@@ -3,14 +3,12 @@ package config
 import (
 	"testing"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"kubevirt.io/client-go/testutils"
 
-	"kubevirt.io/kubevirt/pkg/log"
+	ephemeraldiskutils "kubevirt.io/kubevirt/pkg/ephemeral-disk-utils"
 )
 
 func TestConfig(t *testing.T) {
-	log.Log.SetIOWriter(GinkgoWriter)
-	RegisterFailHandler(Fail)
-	RunSpecs(t, "Config Suite")
+	ephemeraldiskutils.MockDefaultOwnershipManager()
+	testutils.KubeVirtTestSuiteSetup(t)
 }

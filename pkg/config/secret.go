@@ -22,7 +22,7 @@ package config
 import (
 	"path/filepath"
 
-	v1 "kubevirt.io/kubevirt/pkg/api/v1"
+	v1 "kubevirt.io/api/core/v1"
 )
 
 // GetSecretSourcePath returns a path to Secret mounted on a pod
@@ -35,23 +35,22 @@ func GetSecretDiskPath(volumeName string) string {
 	return filepath.Join(SecretDisksDir, volumeName+".iso")
 }
 
+type secretVolumeInfo struct{}
+
+func (i secretVolumeInfo) isValidType(v *v1.Volume) bool {
+	return v.Secret != nil
+}
+func (i secretVolumeInfo) getSourcePath(v *v1.Volume) string {
+	return GetSecretSourcePath(v.Name)
+}
+func (i secretVolumeInfo) getIsoPath(v *v1.Volume) string {
+	return GetSecretDiskPath(v.Name)
+}
+func (i secretVolumeInfo) getLabel(v *v1.Volume) string {
+	return v.Secret.VolumeLabel
+}
+
 // CreateSecretDisks creates Secret iso disks which are attached to vmis
-func CreateSecretDisks(vmi *v1.VirtualMachineInstance) error {
-	for _, volume := range vmi.Spec.Volumes {
-		if volume.Secret != nil {
-
-			var filesPath []string
-			filesPath, err := getFilesLayout(GetSecretSourcePath(volume.Name))
-			if err != nil {
-				return err
-			}
-
-			err = createIsoConfigImage(GetSecretDiskPath(volume.Name), filesPath)
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	return nil
+func CreateSecretDisks(vmi *v1.VirtualMachineInstance, emptyIso bool) error {
+	return createIsoDisksForConfigVolumes(vmi, emptyIso, secretVolumeInfo{})
 }
